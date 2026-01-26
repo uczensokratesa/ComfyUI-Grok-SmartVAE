@@ -145,6 +145,8 @@ class UniversalSmartVAEDecode:
         w_offset = max(0, (w - w_ref) // 2)
         return tensor[:, h_offset:h_offset + h_ref, w_offset:w_offset + w_ref, :]
 
+# ... (reszta klasy taka sama jak w v6.0)
+
     def decode(self, vae, samples, frames_per_batch, overlap_frames=2, force_time_scale=0, 
                enable_tiling=False, tile_size=512, debug_level=1):
         latents = samples["samples"]
@@ -157,45 +159,70 @@ class UniversalSmartVAEDecode:
             return (self._normalize_output(output),)
         
         batch, channels, total_frames, h_latent, w_latent = latents.shape
+        
+        if total_frames <= 0:
+            raise ValueError("No frames in latent input")
+        
+        time_scale, spatial_scale = self.detect_scales(vae, latents, force_time_scale, debug_level)
+        expected_frames = 1 + (total_frames - 1) * time_scale
+        
+        if debug_level > 0:
+            print(f"🎬 Video: {total_frames} latents → ~{expected_frames} frames (scale {time_scale}x)")
+        
         frames_per_batch = max(1, min(frames_per_batch, total_frames))
         overlap_frames = max(0, min(overlap_frames, frames_per_batch - 1))
         initial_batch = frames_per_batch
         initial_tile = tile_size
         fixed_overlap = overlap_frames
         
-        time_scale, spatial_scale = self.detect_scales(vae, latents, force_time_scale, debug_level)
-        expected_frames = 1 + (total_frames - 1) * time_scale
-        cumulative_expected = 0
-        cumulative_actual = 0
-        chunk_count = 0
-        
-        if debug_level > 0:
-            print(f"🎬 Video: {total_frames} latents → ~{expected_frames} frames (Time: {time_scale}x, Spatial: {spatial_scale}x)")
-        
         available_vram = self._get_available_vram()
         if available_vram:
-            est_vram = self._estimate_chunk_vram(frames_per_batch + 2*fixed_overlap, channels, h_latent, w_latent, time_scale, spatial_scale)
-            if est_vram > available_vram * 0.6:
-                frames_per_batch = max(1, int(frames_per_batch * (available_vram * 0.5 / est_vram)))
+            est = self._estimate_chunk_vram(frames_per_batch + 2*fixed_overlap, channels, h_latent, w_latent, time_scale, spatial_scale)
+            if est > available_vram * 0.6:
+                frames_per_batch = max(1, int(frames_per_batch * (available_vram * 0.5 / est)))
                 if debug_level > 0:
-                    print(f"📉 Preemptive: Batch → {frames_per_batch}")
+                    print(f"📉 Preemptive batch → {frames_per_batch}")
         
         output_chunks = []
         h_reference = None
         w_reference = None
         current_batch = frames_per_batch
         start_idx = 0
+        last_start_idx = -1
+        stagnation_counter = 0
+        MAX_STAGNATION = 5  # ile razy pętla może się kręcić bez postępu
         
         pbar = comfy.utils.ProgressBar(total_frames)
         
         while start_idx < total_frames:
             throw_exception_if_processing_interrupted()
             
+            # Anti-infinite-loop guard
+            if start_idx == last_start_idx:
+                stagnation_counter += 1
+                if stagnation_counter >= MAX_STAGNATION:
+                    raise RuntimeError(
+                        f"Infinite loop detected! start_idx stuck at {start_idx} "
+                        f"(current_batch={current_batch}, overlap={overlap_frames}, "
+                        f"ctx_start/ctx_end may be invalid). Try smaller batch or disable tiling."
+                    )
+            else:
+                stagnation_counter = 0
+            last_start_idx = start_idx
+            
             end_idx = min(start_idx + current_batch, total_frames)
+            
             ctx_start = max(0, start_idx - fixed_overlap)
             ctx_end = min(total_frames, end_idx + fixed_overlap)
             
+            # Safety: jeśli chunk nie wnosi nic nowego
+            if ctx_end <= ctx_start:
+                raise RuntimeError(f"Empty chunk detected (ctx {ctx_start}-{ctx_end}) – check overlap/batch params")
+            
             latent_chunk = latents[:, :, ctx_start:ctx_end, :, :]
+            
+            if debug_level >= 2:
+                print(f"Processing chunk: latent {start_idx}→{end_idx} | ctx {ctx_start}→{ctx_end} | batch={current_batch}")
             
             try:
                 with torch.no_grad():
@@ -203,57 +230,48 @@ class UniversalSmartVAEDecode:
                         decoded_chunk = vae.decode_tiled(latent_chunk, tile_x=tile_size, tile_y=tile_size)
                     else:
                         decoded_chunk = vae.decode(latent_chunk)
-            
             except RuntimeError as e:
                 if "out of memory" in str(e).lower():
                     torch.cuda.empty_cache()
                     gc.collect()
                     if debug_level > 0:
-                        print(f"⚠️ OOM at {start_idx}")
+                        print(f"⚠️ OOM at latent {start_idx}")
                     
                     if not enable_tiling:
-                        if debug_level > 0:
-                            print("  → Tiling on")
                         enable_tiling = True
+                        if debug_level > 0: print("  → Tiling enabled")
                         continue
                     
                     if current_batch > 1:
+                        old = current_batch
                         current_batch = max(1, current_batch // 2)
-                        if debug_level > 0:
-                            print(f"  → Batch → {current_batch}")
+                        if debug_level > 0: print(f"  → Batch {old} → {current_batch}")
                         continue
                     
                     if tile_size > 256:
+                        old_tile = tile_size
                         tile_size = max(256, tile_size // 2)
-                        if debug_level > 0:
-                            print(f"  → Tile → {tile_size}px")
+                        if debug_level > 0: print(f"  → Tile {old_tile} → {tile_size}")
                         continue
                     
-                    min_vram = self._estimate_chunk_vram(1, channels, h_latent, w_latent, time_scale, spatial_scale)
-                    raise RuntimeError(
-                        f"Persistent OOM. Min VRAM: ~{min_vram:.1f}GB\nSuggestions: Close apps, lower res, segment, upgrade GPU."
-                    ) from e
+                    raise RuntimeError("Persistent OOM even with minimal settings") from e
                 else:
                     raise
             
             decoded_chunk = self._normalize_output(decoded_chunk)
             
             front_trim = (start_idx - ctx_start) * time_scale
+            
             if end_idx == total_frames:
                 valid_frames = decoded_chunk[front_trim:]
             else:
                 core_length = (end_idx - start_idx) * time_scale
-                valid_frames = decoded_chunk[front_trim:front_trim + core_length]
+                valid_frames = decoded_chunk[front_trim : front_trim + core_length]
             
-            actual_chunk = valid_frames.shape[0]
-            expected_chunk = (end_idx - start_idx) * time_scale if end_idx < total_frames else expected_frames - cumulative_expected
-            diff = abs(actual_chunk - expected_chunk)
-            if diff > 0 and debug_level > 0:
-                print(f"⚠️ Chunk {start_idx}: Diff {diff} frames (expected {expected_chunk}, got {actual_chunk})")
-            
-            cumulative_expected += expected_chunk
-            cumulative_actual += actual_chunk
-            chunk_count += 1
+            actual = valid_frames.shape[0]
+            expected = (end_idx - start_idx) * time_scale if end_idx < total_frames else expected_frames - sum(v.shape[0] for v in output_chunks)
+            if debug_level >= 2 and abs(actual - expected) > 0:
+                print(f"  → Chunk frames: expected ~{expected}, got {actual}")
             
             if h_reference is None:
                 h_reference, w_reference = valid_frames.shape[1:3]
@@ -263,34 +281,22 @@ class UniversalSmartVAEDecode:
             output_chunks.append(valid_frames)
             
             pbar.update(end_idx - start_idx)
+            start_idx = end_idx
             
             del latent_chunk, decoded_chunk
             
-            if current_batch <= 4 or chunk_count % max(2, current_batch // 2) == 0:
+            if current_batch <= 4 or (start_idx // frames_per_batch) % 2 == 0:
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
-            
-            if available_vram and chunk_count % 5 == 0:
-                est_vram = self._estimate_chunk_vram(current_batch + 2*fixed_overlap, channels, h_latent, w_latent, time_scale, spatial_scale)
-                if est_vram < available_vram * 0.6:
-                    if current_batch < initial_batch:
-                        current_batch = min(initial_batch, current_batch + (current_batch // 2))
-                        if debug_level > 1:
-                            print(f"📈 Safe restore: Batch → {current_batch}")
-                    if tile_size < initial_tile:
-                        tile_size = min(initial_tile, tile_size + (tile_size // 2))
-                        if debug_level > 1:
-                            print(f"📈 Safe restore: Tile → {tile_size}px")
         
         final_output = torch.cat(output_chunks, dim=0)
         actual_frames = final_output.shape[0]
-        if debug_level > 0:
-            print(f"✅ Done: {actual_frames} frames (Chunks: {chunk_count}, Avg/chunk: {actual_frames / chunk_count:.1f})")
         
-        frame_diff = abs(actual_frames - expected_frames)
-        if frame_diff > 0:
-            print(f"⚠️ Final diff {frame_diff}. Minor rounding – audio should be close. If desync, try force scale.")
+        print(f"✅ Decode finished: {actual_frames} frames")
+        diff = abs(actual_frames - expected_frames)
+        if diff > 0:
+            print(f"⚠️ Final frame count diff: {diff} (minor rounding ok, large = check scale)")
         
         return (final_output,)
 
