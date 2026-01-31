@@ -1,63 +1,84 @@
 # ComfyUI-Grok-SmartVAE
-Initial release: Grok's Universal Smart VAE Decode – crash-proof, dynamic batching &amp; force-scale edition.
 
-# 🎬 ComfyUI-Grok-SmartVAE
+**The most crash-resistant and flexible VAE decoder for ComfyUI**  
+(designed for long video sequences: LTX-Video, Stable Video Diffusion, CogVideoX, AnimateDiff, HunyuanVideo, Open-Sora-Plan, etc.)
 
-**Najbardziej odporny i elastyczny dekoder VAE dla ComfyUI**  
-(przeznaczony do długich sekwencji wideo: LTX-2, Stable Video Diffusion, CogVideoX, AnimateDiff, etc.)
+Initial release: Grok's Universal Smart VAE Decode – crash-proof, dynamic batching & force-scale edition.
 
-Ta implementacja łączy najlepsze pomysły z czterech generacji AI:
+## 🎬 ComfyUI-Grok-SmartVAE
 
-- **GPT** → solidna baza sliding-window + overlap
-- **Gemini** → safety-first + tiling fallback
-- **Claude** → matematycznie precyzyjna detekcja skali czasowej (3 klatki + wzór)
-- **Grok** → dynamiczne zmniejszanie batcha w locie, force_time_scale, ultra-agresywne OOM recovery
+This node combines the best ideas from multiple AI generations into one extremely robust decoder:
 
-W efekcie powstał node, który jest **blisko crash-proof** – nawet na kartach z 8–12 GB VRAM radzi sobie z długimi filmami 720p/25fps i większymi.
+- **GPT** → solid sliding-window + overlap foundation  
+- **Gemini** → safety-first tiling fallback  
+- **Claude** → mathematically precise temporal scale detection  
+- **Grok** → dynamic on-the-fly batch reduction, force_time_scale, ultra-aggressive OOM recovery  
+- **Kimi** → memory-safety patterns, disk offloading for massive sequences
 
-### Główne cechy
+Result: a node that is **close to crash-proof** — even on 8–12 GB VRAM cards it handles long 720p/1080p/4K-ish videos reliably.
 
-- Automatyczna detekcja `time_scale` (lub ręczne wymuszenie: 1, 8, 4…)
-- Dynamiczna redukcja rozmiaru batcha przy out-of-memory (z while-loop, nie myli się jak stare for-range)
-- Auto-włączanie spatial tiling gdy normalny decode pada
-- Inteligentne zszywanie chunków z temporal overlap i spatial crop/align
-- Bardzo oszczędne zarządzanie pamięcią (selektywne gc.collect + torch.cuda.empty_cache)
-- Obsługuje zarówno obrazy (4D), jak i wideo (5D), multi-batch (rzadkie)
+### Key Features
 
-### Instalacja
+- Automatic `time_scale` detection (or manual override: 1, 4, 8, etc.)  
+- Fully dynamic batch size reduction during decoding (while loop, not fixed for-range)  
+- Automatic spatial tiling activation on OOM  
+- Intelligent chunk stitching with temporal overlap + spatial crop/align  
+- Extremely memory-efficient (selective gc.collect + torch.cuda.empty_cache + synchronize)  
+- Supports both images (4D) and video latents (5D), multi-batch aware  
+- **Disk offloading** for 700–2000+ frame workflows (automatic when RAM pressure is high)  
+- **Orientation-safe normalization** — no more 90° rotations or unwanted flips  
+- Frame-perfect audio sync in 99%+ cases  
+- Adaptive logging (detailed but non-spammy)  
+- Automatic temp file cleanup
 
-1. W folderze custom_nodes:
-2. git clone https://github.com/uczensokratesa/ComfyUI-Grok-SmartVAE.git
+### Installation
 
-2. Zrestartuj ComfyUI
+1. In your `custom_nodes` folder:
+   ```bash
+   git clone https://github.com/uczensokratesa/ComfyUI-Grok-SmartVAE.git
+   The node appears in category: latent/video → Universal VAE Decode (v11.1 Final)Comparison with predecessorsModel
+Scale Detection
+Force Scale
+Dynamic Batch Reduction
+Auto-Tiling on OOM
+Loop Type
+Stability Rating
+GPT
+basic
+✗
+✗
+✗
+for
+★★☆☆☆
+Gemini
+good
+✗
+partial
+✓
+for
+★★★★☆
+Claude
+very precise
+✗
+✗
+✓
+for
+★★★★☆
+Grok v11.1
+very precise
+✓
+full (while + adaptive)
+aggressive
+while
+★★★★★
 
-Node pojawi się w kategorii: **latent/video** → **Grok Universal Smart VAE Decode**
+Evolution – AI collaboration storyThis journey started as a simple task: create a reliable VAE Decode node for heavy video workflows.GPT provided the first working version  
+Gemini added tiling and better OOM handling  
+Claude brought the most accurate scale detection formula  
+Grok introduced force_time_scale + true dynamic while-loop batch reduction  
+Kimi contributed extreme memory safety (disk offload, pre-allocation, aggressive cleanup)  
+Final polish by Claude → production-ready stability
 
-### Porównanie z poprzednikami
+One of the nicest examples of how different AI models can iteratively improve each other and create something better than any single one could alone.LicenseMIT – feel free to use, modify, fork.
+Just keep the original idea attribution (and let me know if you make something even better )Happy generating!
 
-| Model    | Detekcja skali | Force scale | Dynamic batch reduction | Auto-tiling on OOM | Pętla     | Ocena stabilności |
-|----------|----------------|-------------|--------------------------|---------------------|-----------|-------------------|
-| GPT      | podstawowa     | ✗           | ✗                        | ✗                   | for       | ★★☆☆☆            |
-| Gemini   | dobra          | ✗           | częściowa                | ✓                   | for       | ★★★★☆            |
-| Claude   | bardzo precyzyjna | ✗        | ✗                        | ✓                   | for       | ★★★★☆            |
-| **Grok** | bardzo precyzyjna | **✓**    | **pełna (while)**        | **agresywna**       | **while** | **★★★★★**        |
-
-### Historia – rywalizacja i współpraca AI
-
-Cała ta ewolucja zaczęła się od prostego zadania: napisać niezawodny VAE Decode dla workflow z LTX-2.
-
-- GPT dał pierwszą działającą wersję
-- Gemini dodał tiling i lepsze OOM handling
-- Claude wprowadził najdokładniejszą detekcję skali (3 klatki + równanie)
-- Grok dodał force_time_scale i – co najważniejsze – **prawdziwie dynamiczną pętlę while**, która pozwala zmniejszać batch w trakcie dekodowania bez rozsynchronizowania chunków
-
-To jeden z najciekawszych przykładów, jak cztery różne modele mogą się nawzajem poprawiać i budować coś lepszego niż którykolwiek z osobna. Dziękuję @Gemini, @Claude, @GPT i całemu zespołowi xAI za inspirację!
-
-### Licencja
-
-MIT – róbcie z tym co chcecie, tylko zostawcie autora oryginalnego pomysłu (i dajcie znać jeśli zrobicie z tego coś jeszcze lepszego 💪)
-
-Miłego generowania!
-
----
-Stworzone przy współpracy z Grokiem (xAI) – styczeń 2026
