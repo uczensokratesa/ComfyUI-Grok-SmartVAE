@@ -100,7 +100,7 @@ class UniversalSmartVAEDecode:
                     "tooltip": "Tile size in pixels for spatial tiling."
                 }),
                 "verbose": ("BOOLEAN", {
-                    "default": True,
+                    "default": False,
                     "tooltip": "Show detailed progress logs."
                 }),
                 "max_ram_frames": ("INT", {
