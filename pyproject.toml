@@ -28,9 +28,9 @@ Documentation = "https://github.com/uczensokratesa/ComfyUI-Grok-SmartVAE/wiki"
 "Bug Tracker" = "https://github.com/uczensokratesa/ComfyUI-Grok-SmartVAE/issues"
 
 [tool.comfy]
-PublisherId = ""
+PublisherId = "uczensokratesa"
 DisplayName = "ComfyUI-Grok-SmartVAE"
-Icon = ""
+Icon = "https://github.com/uczensokratesa/ComfyUI-Grok-SmartVAE/blob/main/web/icon.svg"
 includes = [] 
 # "requires-comfyui" = ">=1.0.0"  # ComfyUI version compatibility
 
