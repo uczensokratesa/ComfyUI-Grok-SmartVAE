@@ -81,4 +81,5 @@ Final polish by Claude → production-ready stability
 
 One of the nicest examples of how different AI models can iteratively improve each other and create something better than any single one could alone.LicenseMIT – feel free to use, modify, fork.
 Just keep the original idea attribution (and let me know if you make something even better )Happy generating!
+Current version: 11.2 – First official Comfy Registry release
 
