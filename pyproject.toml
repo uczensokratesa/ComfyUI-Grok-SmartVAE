@@ -30,7 +30,7 @@ Documentation = "https://github.com/uczensokratesa/ComfyUI-Grok-SmartVAE/wiki"
 [tool.comfy]
 PublisherId = "uczensokratesa"
 DisplayName = "ComfyUI-Grok-SmartVAE"
-Icon = "https://github.com/uczensokratesa/ComfyUI-Grok-SmartVAE/blob/main/web/icon.svg"
+Icon = "https://github.com/uczensokratesa/ComfyUI-Grok-SmartVAE/blob/main/web/icon.png"
 includes = [] 
 # "requires-comfyui" = ">=1.0.0"  # ComfyUI version compatibility
 

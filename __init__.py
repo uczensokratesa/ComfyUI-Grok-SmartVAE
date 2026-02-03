@@ -1,11 +1,6 @@
-from .nodes import UniversalSmartVAEDecode
+from .universal_smart_vae_video_decode import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
 
-NODE_CLASS_MAPPINGS = {
-    "UniversalSmartVAEDecode": UniversalSmartVAEDecode
-}
+__all__ = ['NODE_CLASS_MAPPINGS', 'NODE_DISPLAY_NAME_MAPPINGS']
+from .universal_smart_vae_video_decode import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
 
-NODE_DISPLAY_NAME_MAPPINGS = {
-    "UniversalSmartVAEDecode": "UniversalSmartVAEDecode"
-}
-
-__all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]
+__all__ = ['NODE_CLASS_MAPPINGS', 'NODE_DISPLAY_NAME_MAPPINGS']
