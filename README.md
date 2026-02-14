@@ -114,3 +114,49 @@ Current version: 11.2 – First official Comfy Registry release
 
 Enjoy massive video workflows without OOM crashes! 🚀
 
+## 🛡️ Ignore Warnings Mode (v1.0.9)
+
+**Problem**: When the sampler runs out of VRAM during long video generation, it produces corrupted latents (100% NaN values) but **doesn't throw an error** (silent OOM). Users then face black frames or workflow crashes without understanding why.
+
+**Solution**: The Streaming node (and VAE) now includes a 3-tier `ignore_warnings` safety system:
+
+### How It Works
+
+1. **Validation on Decode**: Before decoding, the node checks if the latent contains NaN values (corruption indicator)
+2. **Detailed Diagnostics**: Shows exactly which frames are corrupted and corruption percentage
+3. **User Choice**: Instead of hard-failing, users can choose their risk tolerance:
+
+| Mode | Behavior | Use Case |
+|------|----------|----------|
+| **none** (default) | Stop with clear error + solutions | Safe, prevents wasted time |
+| **minor** | Continue if <10% corrupted | Partial recovery (some black frames OK) |
+| **all** | Force decode anyway | Desperate situations (high crash risk) |
+
+### Example Output
+```
+🚨 CORRUPTED LATENT DETECTED!
+   NaN values: 4,567,890 / 49,152,000 (9.29%)
+   Affected frames: 856 to 1200 (out of 1201)
+   
+💊 RECOMMENDED FIXES:
+   1. REDUCE VIDEO LENGTH: 1201 → 720 frames
+   2. REDUCE RESOLUTION
+   3. Lower CFG scale (7.0 → 3.5)
+   4. Enable TensorParallel or CPU offload
+   
+❌ ERROR: Latent contains 9.3% NaN - cannot decode safely.
+To force decode anyway (may produce black frames):
+  Set 'ignore_warnings' to 'minor' (<10%) or 'all' (risky)
+```
+
+User clicks dropdown, selects `minor`, re-runs → frames 856-1200 are black, rest is OK. **User made informed decision** instead of blaming the node.
+
+### Why This Matters
+
+- **Transparency**: Users see exactly what went wrong (VRAM exhaustion in sampler)
+- **Control**: Users choose between "safe but strict" vs "risky but tries anyway"
+- **Education**: Error messages explain root cause + concrete solutions
+- **Psychology**: Prevents "this node is broken" frustration (user took calculated risk)
+
+**Credits**: Idea by Grok, implementation by Claude, inspired by user feedback requesting "decode anyway" option.
+
