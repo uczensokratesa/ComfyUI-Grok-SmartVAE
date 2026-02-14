@@ -1,18 +1,15 @@
 """
-Universal Smart VAE Decode - v11.2 Production Hardened
-Grok v11.0 + Claude refinements + Copilot security fixes
+Universal Smart VAE Decode - v11.3 (Ignore Warnings + NaN safety)
+Production Hardened VAE decoder with disk offloading and user override for corrupted latents
 
-CRITICAL FIXES in v11.2:
-- ZeroDivisionError protection in time scale detection
-- OOM retry limit (prevents infinite loops)
-- Thread-safe VAE cache
-- Proper logging instead of print
-- Atomic temp file handling
-- Better error messages with recovery hints
+CRITICAL FIXES in v11.3:
+- Ignore warnings mode for NaN/corrupted latents
+- Detailed corruption detection (percent, affected frames)
+- 3-tier handling: stop / minor / force
+- Final warning in logs if override used
 
-Credits: Grok (disk offload, orientation), Kimi (memory safety), Claude (stability),
-         Gemini (math), GPT (structure), Copilot (security review)
-Version: 11.2.0
+Credits: Grok (disk offload, orientation), Claude (ignore warnings + safety), Kimi (memory), Gemini (math), GPT (structure)
+Version: 11.3.0
 License: MIT
 GitHub: https://github.com/uczensokratesa/ComfyUI-Grok-SmartVAE
 """
@@ -45,17 +42,16 @@ except ImportError:
 
 class UniversalSmartVAEDecode:
     """
-    Production-grade VAE decoder with disk offloading for massive workflows.
+    Production-grade VAE decoder with disk offloading and safety overrides.
     
     Features:
     - Handles 2000+ frames with automatic memory management
     - Disk offload when RAM insufficient
-    - Frame-perfect audio sync
+    - Frame-perfect audio sync (if integrated downstream)
     - Multi-stage OOM recovery
-    - Thread-safe caching
+    - NEW: Ignore warnings for corrupted latents (risk of black frames)
     """
     
-    # Class-level constants
     MAX_OOM_RETRIES = 5
     DISK_MERGE_CHUNK_SIZE = 10
     
@@ -110,6 +106,15 @@ class UniversalSmartVAEDecode:
                     "step": 100,
                     "tooltip": "Threshold for disk offload. Tune to system RAM: 16GB=300, 32GB=600, 64GB=1000."
                 }),
+                "ignore_warnings": (["none", "minor", "all"], {
+                    "default": "none",
+                    "tooltip": (
+                        "Corrupted latent handling:\n"
+                        "• none = Stop on NaN/corruption (safest)\n"
+                        "• minor = Try if <10% corrupt (may produce black frames)\n"
+                        "• all = Force decode anyway (high crash/black frames risk)"
+                    )
+                }),
             }
         }
 
@@ -118,16 +123,14 @@ class UniversalSmartVAEDecode:
     CATEGORY = "latent/video"
 
     def __init__(self):
-        # Thread-safe per-VAE cache (dict instead of single values)
         self._time_scale_cache = {}
         self._force_scale_cache = {}
         self.temp_dir = None
+        self._verbose = False
         
-        # Register cleanup
         atexit.register(self._cleanup_temp_dir)
 
     def _cleanup_temp_dir(self):
-        """Cleanup temporary files (called on exit or error)."""
         if self.temp_dir and os.path.exists(self.temp_dir):
             try:
                 for file in os.listdir(self.temp_dir):
@@ -141,11 +144,9 @@ class UniversalSmartVAEDecode:
                 logger.debug(f"Temp dir cleanup error: {e}")
 
     def __del__(self):
-        """Backup cleanup on object destruction."""
         self._cleanup_temp_dir()
 
     def _get_available_vram(self) -> Optional[float]:
-        """Get available VRAM in GB. Returns None on CPU or error."""
         try:
             if not torch.cuda.is_available():
                 return None
@@ -156,7 +157,6 @@ class UniversalSmartVAEDecode:
             return None
 
     def _get_available_ram(self) -> Optional[float]:
-        """Get available system RAM in GB. Returns None if psutil unavailable."""
         if PSUTIL_AVAILABLE:
             try:
                 return psutil.virtual_memory().available / (1024 ** 3)
@@ -166,26 +166,10 @@ class UniversalSmartVAEDecode:
 
     def detect_time_scale(self, vae, latents: torch.Tensor, force_scale: int = 0, 
                           verbose: bool = True) -> int:
-        """
-        Detect temporal upsampling scale with ZeroDivisionError protection.
-        
-        Priority: force > cache > metadata > empirical test > fallback
-        
-        Args:
-            vae: VAE model
-            latents: Input latent tensor [B, C, F, H, W]
-            force_scale: User override (0 = auto)
-            verbose: Log detection process
-            
-        Returns:
-            Detected time scale (integer >= 1)
-        """
         vae_id = id(vae)
         
-        # Priority 1: User override
         if force_scale > 0:
             if self._force_scale_cache.get(vae_id) != force_scale:
-                # Invalidate time scale cache if force changed
                 self._time_scale_cache.pop(vae_id, None)
                 self._force_scale_cache[vae_id] = force_scale
             
@@ -195,14 +179,11 @@ class UniversalSmartVAEDecode:
             self._time_scale_cache[vae_id] = force_scale
             return force_scale
         
-        # Clear force scale tracking
         self._force_scale_cache.pop(vae_id, None)
         
-        # Priority 2: Cache check
         if vae_id in self._time_scale_cache:
             return self._time_scale_cache[vae_id]
         
-        # Priority 3: VAE metadata
         if hasattr(vae, 'downscale_index_formula') and vae.downscale_index_formula:
             try:
                 time_scale = int(vae.downscale_index_formula[0])
@@ -211,20 +192,15 @@ class UniversalSmartVAEDecode:
                 self._time_scale_cache[vae_id] = time_scale
                 return time_scale
             except Exception as e:
-                logger.debug(f"Metadata parsing failed: {e}")
+                logger.debug(f"Metadata parse failed: {e}")
         
-        # Priority 4: Empirical test (with ZeroDivisionError protection)
         try:
             total_latent_frames = latents.shape[2]
             test_frames = min(5, total_latent_frames)
             
-            # CRITICAL FIX: Prevent division by zero
             if test_frames <= 1:
                 if verbose:
-                    logger.warning(
-                        f"Not enough frames ({test_frames}) for empirical detection. "
-                        f"Using fallback: 1x"
-                    )
+                    logger.warning(f"Insufficient frames for detection. Fallback: 1x")
                 self._time_scale_cache[vae_id] = 1
                 return 1
             
@@ -236,17 +212,13 @@ class UniversalSmartVAEDecode:
             test_output = self._normalize_output(test_output, aspect_ratio=1.0)
             output_frames = test_output.shape[0]
             
-            # Formula: output = 1 + (input - 1) * scale
-            # Solving: scale = (output - 1) / (input - 1)
-            # SAFE: test_frames > 1 guaranteed by check above
             time_scale = max(1, (output_frames - 1) // (test_frames - 1))
             
             if verbose:
-                logger.info(f"🔍 Auto-detected time scale: {time_scale}x ({test_frames}→{output_frames} frames)")
+                logger.info(f"🔍 Auto-detected: {time_scale}x ({test_frames}→{output_frames})")
             
             self._time_scale_cache[vae_id] = time_scale
             
-            # Cleanup
             del test_output, test_sample
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -255,21 +227,13 @@ class UniversalSmartVAEDecode:
         
         except Exception as e:
             if verbose:
-                logger.warning(f"Time scale detection failed: {e}")
-                logger.info("Using safe fallback: 1x")
+                logger.warning(f"Detection failed: {e}. Fallback: 1x")
             
             self._time_scale_cache[vae_id] = 1
             return 1
 
     def detect_output_size(self, vae, latents: torch.Tensor, h_latent: int, w_latent: int, 
                            tile_size: int = 512, verbose: bool = True) -> Tuple[int, int]:
-        """
-        Detect exact output H/W from single frame decode.
-        Falls back to tiled decode if standard OOMs.
-        
-        Returns:
-            (output_height, output_width) tuple
-        """
         aspect_ratio = h_latent / float(w_latent)
         test_sample = latents[:, :, 0:1, :, :]
         
@@ -277,7 +241,7 @@ class UniversalSmartVAEDecode:
             with torch.no_grad():
                 test_out = vae.decode(test_sample)
             if verbose:
-                logger.info("🔍 Output size detected (standard decode)")
+                logger.info("🔍 Output size detected (standard)")
         except RuntimeError as e:
             if "out of memory" in str(e).lower():
                 if torch.cuda.is_available():
@@ -288,7 +252,7 @@ class UniversalSmartVAEDecode:
                     with torch.no_grad():
                         test_out = vae.decode_tiled(test_sample, tile_x=tile_size, tile_y=tile_size)
                     if verbose:
-                        logger.info("🔍 Output size detected (tiled - OOM fallback)")
+                        logger.info("🔍 Output size detected (tiled)")
                 except Exception as inner_e:
                     raise RuntimeError("Failed to detect output size even with tiling.") from inner_e
             else:
@@ -297,7 +261,6 @@ class UniversalSmartVAEDecode:
         test_out = self._normalize_output(test_out, aspect_ratio)
         output_h, output_w = test_out.shape[1:3]
         
-        # Cleanup
         del test_out, test_sample
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -307,7 +270,6 @@ class UniversalSmartVAEDecode:
 
     def _estimate_chunk_vram(self, frames: int, channels: int, h: int, w: int, 
                             time_scale: int = 1) -> float:
-        """Estimate VRAM needed for chunk decode (GB)."""
         spatial_scale = 8
         latent_bytes = frames * channels * h * w * 4
         output_frames = frames * time_scale
@@ -316,22 +278,10 @@ class UniversalSmartVAEDecode:
         return total_bytes / (1024 ** 3)
 
     def _estimate_output_ram(self, expected_frames: int, output_h: int, output_w: int) -> float:
-        """Estimate total RAM for output tensor (GB)."""
         bytes_per_frame = output_h * output_w * 3 * 4
         return (expected_frames * bytes_per_frame) / (1024 ** 3)
 
     def _normalize_output(self, tensor, aspect_ratio: Optional[float] = None) -> torch.Tensor:
-        """
-        Normalize VAE output to [Frames, Height, Width, Channels].
-        
-        Args:
-            tensor: VAE output (4D or 5D)
-            aspect_ratio: Latent h/w ratio for orientation detection
-            
-        Returns:
-            Normalized [F, H, W, C] tensor
-        """
-        # Handle list/tuple
         if isinstance(tensor, (list, tuple)):
             if not tensor:
                 raise ValueError("VAE returned empty output")
@@ -340,72 +290,73 @@ class UniversalSmartVAEDecode:
         if not isinstance(tensor, torch.Tensor):
             raise TypeError(f"Expected Tensor, got {type(tensor)}")
         
-        # Ensure float32
         if tensor.dtype != torch.float32:
             tensor = tensor.float()
         
         dim = tensor.dim()
         
         if dim == 4:
-            # [N, C, H, W] or [N, H, W, C]
             if tensor.shape[1] in (3, 4):
                 tensor = tensor.permute(0, 2, 3, 1)
         
         elif dim == 5:
             shape = list(tensor.shape)
             
-            # Squeeze B=1
             if shape[0] == 1:
                 tensor = tensor.squeeze(0)
                 shape = list(tensor.shape)
             
-            # Find channel dim
             try:
                 c_idx = next(i for i, s in enumerate(shape) if s in (3, 4))
             except StopIteration:
-                raise ValueError(f"Cannot find channel dim (3 or 4) in shape {shape}")
+                raise ValueError(f"Cannot find channel dim in {shape}")
             
-            # Remaining are [F, H, W]
             remaining_idxs = [i for i in range(4) if i != c_idx]
             remaining_sizes = [shape[i] for i in remaining_idxs]
             
-            # Sort: smallest=F, largest two=spatial
             sorted_remaining = sorted(zip(remaining_idxs, remaining_sizes), key=lambda x: x[1])
             f_idx = sorted_remaining[0][0]
             spatial_large_idx = sorted_remaining[2][0]
             spatial_small_idx = sorted_remaining[1][0]
             
-            # Assign H/W based on aspect ratio
             if aspect_ratio is not None:
                 if aspect_ratio > 1.0:
-                    # Portrait: H > W
                     h_idx = spatial_large_idx
                     w_idx = spatial_small_idx
                 else:
-                    # Landscape: W > H
                     w_idx = spatial_large_idx
                     h_idx = spatial_small_idx
             else:
-                # Default: portrait
                 h_idx = spatial_large_idx
                 w_idx = spatial_small_idx
             
-            # Permute to [F, H, W, C]
             perm = [f_idx, h_idx, w_idx, c_idx]
             tensor = tensor.permute(*perm)
         
         else:
-            raise ValueError(f"Unsupported dimension: {dim}D, shape {tensor.shape}")
+            raise ValueError(f"Unsupported: {dim}D, shape {tensor.shape}")
         
-        # Clamp and convert RGBA→RGB
+        min_val = tensor.min().item()
+        max_val = tensor.max().item()
+        
+        if min_val < 0.0:
+            tensor = (tensor + 1.0) / 2.0
+        
+        tensor = torch.nan_to_num(tensor, nan=0.0, posinf=1.0, neginf=0.0)
         tensor = torch.clamp(tensor, 0.0, 1.0)
+        
+        if self._verbose:
+            if min_val < 0.0 or max_val > 1.0:
+                logger.warning(f"Normalize: auto-scaled and clamped [{min_val:.4f}, {max_val:.4f}] → [0,1]")
+            if torch.isnan(tensor).any() or torch.isinf(tensor).any():
+                logger.warning("NaN/Inf detected and cleaned in output!")
+        
         if tensor.shape[-1] > 3:
             tensor = tensor[..., :3]
         
         return tensor.contiguous()
 
     def _center_crop_to_reference(self, tensor: torch.Tensor, h_ref: int, w_ref: int) -> torch.Tensor:
-        """Center crop to reference dimensions."""
         _, h, w, _ = tensor.shape
         if h == h_ref and w == w_ref:
             return tensor
@@ -416,16 +367,13 @@ class UniversalSmartVAEDecode:
         return tensor[:, h_offset:h_offset + h_ref, w_offset:w_offset + w_ref, :]
 
     def decode(self, vae, samples, frames_per_batch, overlap_frames=2, force_time_scale=0, 
-               enable_tiling=False, tile_size=512, verbose=True, max_ram_frames=500):
+               enable_tiling=False, tile_size=512, verbose=True, max_ram_frames=500,
+               ignore_warnings="none"):
         """
-        Main decode with disk offloading and OOM protection.
+        Main decode with disk offloading, OOM protection and corrupted latent override.
+        """
+        self._verbose = verbose
         
-        Features:
-        - Automatic disk offload for 700+ frame workflows
-        - Multi-stage OOM recovery with retry limits
-        - Frame-perfect audio sync
-        - Thread-safe operation
-        """
         latents = samples["samples"]
         
         # ======== IMAGE PATH ========
@@ -447,6 +395,85 @@ class UniversalSmartVAEDecode:
         if total_frames <= 0:
             raise ValueError("Latent has no frames")
         
+        if verbose:
+            logger.info("🔍 Validating latent...")
+        
+        # ============= LATENT VALIDATION + IGNORE WARNINGS =============
+        if torch.isnan(latents).any():
+            nan_count = torch.isnan(latents).sum().item()
+            total_elements = latents.numel()
+            nan_percent = (nan_count / total_elements) * 100
+            
+            logger.error("=" * 70)
+            logger.error("🚨 CORRUPTED LATENT DETECTED!")
+            logger.error(f"   NaN values: {nan_count:,} / {total_elements:,} ({nan_percent:.2f}%)")
+            logger.error(f"   Shape: {latents.shape}")
+            
+            nan_frames = torch.isnan(latents).any(dim=(0,1,3,4)).nonzero(as_tuple=True)[0]
+            if len(nan_frames) > 0:
+                first_bad = nan_frames[0].item()
+                last_bad = nan_frames[-1].item()
+                logger.error(f"   Affected frames: {first_bad} to {last_bad}")
+                logger.error(f"   → Corruption likely started around frame {first_bad}")
+            
+            logger.error("")
+            logger.error("💊 RECOMMENDED FIXES:")
+            logger.error("   1. REDUCE VIDEO LENGTH (most effective)")
+            logger.error(f"      Current: {total_frames} frames → try {int(total_frames * 0.6)}")
+            logger.error("   2. REDUCE RESOLUTION")
+            logger.error("   3. Lower CFG scale (e.g. 3.5 instead of 7.0)")
+            logger.error("   4. Use TensorParallel or Kijaji nodes")
+            logger.error("   5. Clear VRAM before sampling")
+            logger.error("=" * 70)
+            
+            if ignore_warnings == "none":
+                raise ValueError(
+                    f"Latent contains {nan_percent:.1f}% NaN values - cannot decode safely.\n"
+                    f"The sampler ran out of VRAM.\n\n"
+                    f"To force decode anyway (may produce black frames):\n"
+                    f"  Set 'ignore_warnings' to 'minor' (<10%) or 'all' (risky)"
+                )
+            
+            elif ignore_warnings == "minor":
+                if nan_percent > 10.0:
+                    raise ValueError(
+                        f"Latent is {nan_percent:.1f}% corrupted (limit: 10% for 'minor' mode).\n"
+                        f"This is too severe - output would be mostly black.\n\n"
+                        f"Options:\n"
+                        f"  1. Reduce video length/resolution and re-sample\n"
+                        f"  2. Set 'ignore_warnings' to 'all' (not recommended)"
+                    )
+                
+                logger.warning("=" * 70)
+                logger.warning("⚠️ CONTINUING WITH CORRUPTED LATENT (user override)")
+                logger.warning(f"   Corruption: {nan_percent:.2f}% (under 10% threshold)")
+                logger.warning(f"   Frames {first_bad}-{last_bad} will likely be BLACK")
+                logger.warning("   Rest of video may be OK")
+                logger.warning("=" * 70)
+                
+                latents = torch.nan_to_num(latents, nan=0.0, posinf=1.0, neginf=0.0)
+            
+            elif ignore_warnings == "all":
+                logger.error("=" * 70)
+                logger.error("🚨 FORCING DECODE WITH SEVERELY CORRUPTED LATENT!")
+                logger.error(f"   Corruption: {nan_percent:.2f}%")
+                logger.error("   ⚠️ WARNING: Output will likely be:")
+                logger.error("      • Mostly/entirely BLACK")
+                logger.error("      • May CRASH during decode")
+                logger.error("      • Waste time and produce unusable file")
+                logger.error("")
+                logger.error("   You have been warned. Proceeding anyway...")
+                logger.error("=" * 70)
+                
+                latents = torch.nan_to_num(latents, nan=0.0, posinf=1.0, neginf=0.0)
+        
+        if torch.isinf(latents).any():
+            raise ValueError("Latent contains Inf values - upstream overflow!")
+        
+        if verbose:
+            logger.info("✓ Latent validation passed")
+        # ===============================================================
+
         # Detect scales
         time_scale = self.detect_time_scale(vae, latents, force_time_scale, verbose)
         expected_frames = 1 + (total_frames - 1) * time_scale
@@ -459,19 +486,16 @@ class UniversalSmartVAEDecode:
         est_ram = self._estimate_output_ram(expected_frames, output_h, output_w)
         available_ram = self._get_available_ram()
         
-        # Decide memory mode
         use_disk_offload = (
             expected_frames > max_ram_frames or
             (available_ram is not None and est_ram > available_ram * 0.5)
         )
         
-        # Setup temp dir
         if use_disk_offload:
             self.temp_dir = tempfile.mkdtemp(prefix="comfy_smartvae_")
             if verbose:
                 logger.info(f"💾 Disk offload enabled ({expected_frames} frames, est {est_ram:.2f}GB RAM)")
         
-        # Display info
         if verbose:
             logger.info(f"🎬 Video decode:")
             logger.info(f"   Input: {total_frames} latent frames")
@@ -494,12 +518,10 @@ class UniversalSmartVAEDecode:
                     f"Consider lowering resolution or increasing max_ram_frames."
                 )
         
-        # Validate parameters
         frames_per_batch = max(1, min(frames_per_batch, total_frames))
         overlap_frames = max(0, min(overlap_frames, frames_per_batch - 1))
         initial_overlap = overlap_frames
         
-        # VRAM optimization
         available_vram = self._get_available_vram()
         if available_vram is not None:
             chunk_frames = frames_per_batch + 2 * overlap_frames
@@ -520,12 +542,10 @@ class UniversalSmartVAEDecode:
             logger.info(f"   Batch size: {frames_per_batch}")
             logger.info(f"   Overlap: {overlap_frames} frames")
         
-        # Initialize storage
         temp_files = [] if use_disk_offload else None
         final_output = None
         current_write_idx = 0
         
-        # Pre-allocation
         if not use_disk_offload:
             try:
                 final_output = torch.empty(
@@ -544,7 +564,6 @@ class UniversalSmartVAEDecode:
                 self.temp_dir = tempfile.mkdtemp(prefix="comfy_smartvae_")
                 temp_files = []
         
-        # Processing state
         current_batch = frames_per_batch
         start_idx = 0
         frames_processed = 0
@@ -552,20 +571,17 @@ class UniversalSmartVAEDecode:
         stagnation_count = 0
         MAX_STAGNATION = 3
         cumulative_output_frames = 0
-        oom_retry_count = 0  # CRITICAL FIX: OOM retry limit
+        oom_retry_count = 0
         
         pbar = comfy.utils.ProgressBar(total_frames)
         
-        # Adaptive logging
         est_total_chunks = math.ceil(total_frames / frames_per_batch)
         log_every_n = 5 if est_total_chunks > 20 else 1
         chunk_count = 0
         
-        # ======== PROCESSING LOOP WITH RETRY LIMIT ========
         while start_idx < total_frames:
             throw_exception_if_processing_interrupted()
             
-            # CRITICAL FIX: OOM retry limit
             if oom_retry_count >= self.MAX_OOM_RETRIES:
                 raise RuntimeError(
                     f"Exceeded maximum OOM retries ({self.MAX_OOM_RETRIES}).\n"
@@ -577,7 +593,6 @@ class UniversalSmartVAEDecode:
                     f"  3. Process video in smaller segments"
                 )
             
-            # Stagnation guard
             if frames_processed == last_frames_processed:
                 stagnation_count += 1
                 if stagnation_count >= MAX_STAGNATION:
@@ -599,7 +614,6 @@ class UniversalSmartVAEDecode:
             
             latent_chunk = latents[:, :, ctx_start:ctx_end, :, :]
             
-            # Logging
             should_log = verbose and (chunk_count % log_every_n == 0 or end_idx == total_frames)
             if should_log:
                 mem_gb = torch.cuda.memory_allocated() / (1024**3) if torch.cuda.is_available() else 0
@@ -609,7 +623,6 @@ class UniversalSmartVAEDecode:
                     f"VRAM: {mem_gb:.2f}GB"
                 )
             
-            # Decode with recovery
             try:
                 with torch.no_grad():
                     if enable_tiling and hasattr(vae, 'decode_tiled'):
@@ -618,7 +631,15 @@ class UniversalSmartVAEDecode:
                         decoded_chunk = vae.decode(latent_chunk)
                     decoded_chunk = decoded_chunk.cpu()
                 
-                # Success - reset OOM counter
+                decoded_chunk = torch.nan_to_num(decoded_chunk, nan=0.0, posinf=1.0, neginf=0.0)
+                decoded_chunk = torch.clamp(decoded_chunk, min=0.0, max=1.0)
+                
+                if verbose:
+                    min_val = decoded_chunk.min().item()
+                    max_val = decoded_chunk.max().item()
+                    if min_val < 0.0 or max_val > 1.0:
+                        logger.warning(f"   Chunk clamped: [{min_val:.4f}, {max_val:.4f}] → [0,1]")
+                
                 oom_retry_count = 0
             
             except RuntimeError as e:
@@ -628,13 +649,11 @@ class UniversalSmartVAEDecode:
                     if verbose:
                         logger.warning(f"OOM at frame {start_idx} (retry {oom_retry_count}/{self.MAX_OOM_RETRIES})")
                     
-                    # Cleanup
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
                         torch.cuda.synchronize()
                     gc.collect()
                     
-                    # Stage 1: Enable tiling
                     if not enable_tiling:
                         logger.info("→ Stage 1: Enabling tiling")
                         enable_tiling = True
@@ -643,7 +662,6 @@ class UniversalSmartVAEDecode:
                         )
                         continue
                     
-                    # Stage 2: Reduce batch
                     if current_batch > 1:
                         old_batch = current_batch
                         current_batch = max(1, current_batch // 2)
@@ -651,23 +669,18 @@ class UniversalSmartVAEDecode:
                         logger.info(f"→ Stage 2: Batch {old_batch} → {current_batch}")
                         continue
                     
-                    # Stage 3: Reduce tile
                     if tile_size > 256:
                         old_tile = tile_size
                         tile_size = max(256, tile_size - 128)
                         logger.info(f"→ Stage 3: Tile {old_tile} → {tile_size}px")
                         continue
                     
-                    # All strategies exhausted, increment counter and continue
-                    # Will hit MAX_OOM_RETRIES at top of loop
                     continue
                 else:
                     raise
             
-            # Normalize
             decoded_chunk = self._normalize_output(decoded_chunk, aspect_ratio)
             
-            # Temporal trimming
             front_trim = (start_idx - ctx_start) * time_scale
             
             if end_idx == total_frames:
@@ -676,7 +689,6 @@ class UniversalSmartVAEDecode:
                 core_length = (end_idx - start_idx) * time_scale
                 valid_frames = decoded_chunk[front_trim:front_trim + core_length]
             
-            # Validation
             actual = valid_frames.shape[0]
             if end_idx < total_frames:
                 expected = (end_idx - start_idx) * time_scale
@@ -686,17 +698,14 @@ class UniversalSmartVAEDecode:
             if should_log and abs(actual - expected) > 0:
                 logger.info(f"  Chunk frames: expected {expected}, got {actual}")
             
-            # Spatial alignment
             valid_frames = self._center_crop_to_reference(valid_frames, output_h, output_w)
             
-            # First chunk orientation check
             if verbose and chunk_count == 0:
                 logger.info(f"✓ First chunk: shape {valid_frames.shape}")
                 if (aspect_ratio > 1.0 and valid_frames.shape[2] > valid_frames.shape[1]) or \
                    (aspect_ratio < 1.0 and valid_frames.shape[1] > valid_frames.shape[2]):
                     warnings.warn("Orientation mismatch! Output may be rotated.")
             
-            # Store
             if use_disk_offload:
                 temp_path = os.path.join(self.temp_dir, f"chunk_{chunk_count:06d}.pt")
                 torch.save(valid_frames, temp_path)
@@ -705,7 +714,6 @@ class UniversalSmartVAEDecode:
                 final_output[current_write_idx:current_write_idx + actual] = valid_frames
                 current_write_idx += actual
             
-            # Progress update
             processed_this_chunk = end_idx - start_idx
             frames_processed += processed_this_chunk
             cumulative_output_frames += actual
@@ -713,7 +721,6 @@ class UniversalSmartVAEDecode:
             start_idx = end_idx
             chunk_count += 1
             
-            # Cleanup
             del latent_chunk, decoded_chunk, valid_frames
             
             if chunk_count % 3 == 0 or current_batch <= 4:
@@ -722,7 +729,6 @@ class UniversalSmartVAEDecode:
                     torch.cuda.synchronize()
                     torch.cuda.empty_cache()
         
-        # ======== FINAL ASSEMBLY ========
         if use_disk_offload:
             if verbose:
                 logger.info(f"🛡️  Assembling {len(temp_files)} chunks from disk...")
@@ -732,13 +738,11 @@ class UniversalSmartVAEDecode:
                 chunk = torch.load(temp_path, map_location='cpu')
                 chunks.append(chunk)
                 
-                # Cleanup
                 try:
                     os.remove(temp_path)
                 except Exception as e:
                     logger.debug(f"Failed to remove temp file: {e}")
                 
-                # Merge every N chunks
                 if len(chunks) >= self.DISK_MERGE_CHUNK_SIZE or i == len(temp_files) - 1:
                     merged = torch.cat(chunks, dim=0)
                     chunks = [merged]
@@ -746,29 +750,34 @@ class UniversalSmartVAEDecode:
             
             final_output = chunks[0] if chunks else torch.empty((0, output_h, output_w, 3), dtype=torch.float32)
             
-            # Cleanup temp dir
             self._cleanup_temp_dir()
             self.temp_dir = None
         
-        # Trim if over-allocated
         if final_output.shape[0] > expected_frames:
             final_output = final_output[:expected_frames]
         
-        # Final cleanup
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
         
-        # Validation
         actual_frames = final_output.shape[0]
+        
+        # ============= FINAL WARNING =============
+        if ignore_warnings != "none":
+            logger.warning("=" * 70)
+            logger.warning("⚠️ VIDEO DECODED WITH WARNINGS IGNORED")
+            logger.warning(f"   Mode: '{ignore_warnings}'")
+            logger.warning(f"   Some frames MAY BE BLACK or corrupted")
+            logger.warning("   Recommend: Check output before sharing")
+            logger.warning("=" * 70)
+        # =========================================
         
         if verbose:
             logger.info(f"✅ Decode complete!")
             logger.info(f"   Output frames: {actual_frames}")
             logger.info(f"   Final shape: {final_output.shape}")
         
-        # Audio sync check
         frame_diff = abs(actual_frames - expected_frames)
         if frame_diff == 0:
             if verbose:
@@ -786,11 +795,10 @@ class UniversalSmartVAEDecode:
         return (final_output,)
 
 
-# ======== NODE REGISTRATION ========
 NODE_CLASS_MAPPINGS = {
     "UniversalSmartVAEDecode": UniversalSmartVAEDecode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "UniversalSmartVAEDecode": "🎬 Universal VAE Decode (v11.2 Hardened)",
+    "UniversalSmartVAEDecode": "🎬 Universal VAE Decode (v11.3 + Ignore Warnings)",
 }
