@@ -936,15 +936,12 @@ class UniversalSmartVAEVideoDecode:
             else:
                 raise
         
-        if expected_frames is not None and total_frames != expected_frames:
-            logger.warning("=" * 70)
-            logger.warning(f"⚠️ FRAME COUNT MISMATCH!")
-            logger.warning(f"   Expected: {expected_frames} frames")
-            logger.warning(f"   Got:      {total_frames} frames")
-            logger.warning(f"   Difference: {abs(total_frames - expected_frames)} frames")
-            logger.warning("   This may indicate partial OOM during sampling.")
-            logger.warning("   Continuing anyway, but output may be truncated.")
-            logger.warning("=" * 70)
+        # 2. Info o frame conversion (nie warning!)
+        if verbose and expected_frames is not None:
+            logger.info(f"📊 Frame conversion:")
+            logger.info(f"   Latent frames: {total_frames}")
+            logger.info(f"   Time scale: {time_scale}x")
+            logger.info(f"   Output frames: ~{expected_frames} ({expected_frames/24:.1f}s @ 24fps)")
         
         if total_frames > 1000:
             original_batch = frames_per_batch
