@@ -1,349 +1,59 @@
 """
-Universal Smart VAE Video Decode - Streaming Node (FINAL with Ignore Warnings)
-Production-ready standalone node for streaming video decoding.
+Universal Smart VAE Decode - v11.3 (Ignore Warnings + NaN safety)
+Production Hardened VAE decoder with disk offloading and user override for corrupted latents
 
-Based on: UniversalSmartVAEDecode v11.2 + streaming extensions
-Refinements: Claude (final polish + ignore warnings), Grok (implementation), Gemini (recovery), AI ensemble
+CRITICAL FIXES in v11.3:
+- Ignore warnings mode for NaN/corrupted latents
+- Detailed corruption detection (percent, affected frames)
+- 3-tier handling: stop / minor / force
+- Final warning in logs if override used
 
-Features:
-- Frame-by-frame decoding (80% less RAM than standard pipeline)
-- Crash recovery with resume capability
-- Thumbnail previews in ComfyUI UI
-- Multiple codecs: h264, h265, prores, FFV1 lossless
-- Progress tracking with file write percentage
-- Audio muxing support (now with AUDIO input support)
-- Auto-detection of RAM/VRAM availability
-- NEW: Ignore warnings mode (risk of black frames)
-
-Version: 1.0.9 (Ignore Warnings + NaN handling from Claude)
+Credits: Grok (disk offload, orientation), Claude (ignore warnings + safety), Kimi (memory), Gemini (math), GPT (structure)
+Version: 11.3.0
 License: MIT
+GitHub: https://github.com/uczensokratesa/ComfyUI-Grok-SmartVAE
 """
 
 import torch
-import os
-import time
-import json
-import logging
-from typing import Optional, Tuple
-import gc
 import comfy.utils
 from comfy.model_management import throw_exception_if_processing_interrupted
+import gc
+import math
+import os
+import tempfile
 import warnings
-import folder_paths
-import subprocess
-import numpy as np
+import atexit
+import logging
+from typing import Optional, Tuple
 
+# Setup logging
 logger = logging.getLogger(__name__)
-
-# Dependencies check
-try:
-    import imageio
-    IMAGEIO_AVAILABLE = True
-except ImportError:
-    IMAGEIO_AVAILABLE = False
-    warnings.warn(
-        "imageio not available. Install with: pip install imageio imageio-ffmpeg\n"
-        "This node requires imageio for video encoding."
-    )
-
-try:
-    import numpy as np
-    NUMPY_AVAILABLE = True
-except ImportError:
-    NUMPY_AVAILABLE = False
-    warnings.warn("numpy not available - required for this node")
-
-try:
-    import cv2
-    CV2_AVAILABLE = True
-except ImportError:
-    CV2_AVAILABLE = False
-    logger.info("cv2 not available - preview thumbnails will be skipped")
 
 try:
     import psutil
     PSUTIL_AVAILABLE = True
 except ImportError:
     PSUTIL_AVAILABLE = False
-    logger.info("psutil not available - RAM estimation unavailable")
-
-try:
-    import torchaudio
-    TORCHAUDIO_AVAILABLE = True
-except ImportError:
-    TORCHAUDIO_AVAILABLE = False
-    logger.info("torchaudio not available - fallback to FFmpeg for AUDIO input.")
+    warnings.warn(
+        "psutil not available. Install with 'pip install psutil' for automatic RAM detection.\n"
+        "Disk offload will still work based on max_ram_frames threshold."
+    )
 
 
-class StreamingVideoConfig:
-    """Configuration for streaming video decode."""
-    
-    CODECS = {
-        "h264": {
-            "codec": "libx264",
-            "ext": "mp4",
-            "output_params": ['-crf', '23', '-preset', 'slow'],
-            "pixel_format": "yuv420p",
-            "description": "H.264 (best compatibility, good quality)"
-        },
-        "h265": {
-            "codec": "libx265",
-            "ext": "mp4",
-            "output_params": ['-crf', '28', '-preset', 'slow'],
-            "pixel_format": "yuv420p",
-            "description": "H.265/HEVC (50% smaller files, slower encode)"
-        },
-        "prores": {
-            "codec": "prores_ks",
-            "ext": "mov",
-            "output_params": ['-profile:v', '3'],
-            "pixel_format": "yuv422p10le",
-            "description": "ProRes 422 (professional, large files)"
-        },
-        "ffv1": {
-            "codec": "ffv1",
-            "ext": "mkv",
-            "output_params": ['-level', '3', '-g', '1', '-slices', '4', '-slicecrc', '1'],
-            "pixel_format": "yuv444p",
-            "description": "FFV1 (lossless archival, very large files)"
-        }
-    }
-    
-    PREVIEW_INTERVAL = 50
-    METADATA_SAVE_INTERVAL = 100
-
-
-class StreamingVideoWriter:
-    """Handles streaming video encoding with crash recovery."""
-    
-    def __init__(self, output_path: str, fps: int, codec: str, 
-                 width: int, height: int, resume: bool = False):
-        self.output_path = output_path
-        self.fps = fps
-        self.codec = codec
-        self.width = width
-        self.height = height
-        self.resume = resume
-        
-        self.metadata_path = output_path + ".metadata.json"
-        self.temp_path = output_path + ".tmp"
-        
-        self.writer = None
-        self.frames_written = 0
-        self.last_preview = None
-        
-        if resume and os.path.exists(self.metadata_path):
-            self._load_metadata()
-        
-        self._init_writer()
-    
-    def _init_writer(self):
-        """Initialize video writer."""
-        if not IMAGEIO_AVAILABLE:
-            raise RuntimeError(
-                "imageio required for video encoding.\n"
-                "Install: pip install imageio imageio-ffmpeg"
-            )
-        
-        codec_config = StreamingVideoConfig.CODECS.get(
-            self.codec, 
-            StreamingVideoConfig.CODECS["h264"]
-        )
-        
-        write_path = self.temp_path if not self.resume else self.output_path
-        
-        try:
-            self.writer = imageio.get_writer(
-                write_path,
-                fps=self.fps,
-                codec=codec_config["codec"],
-                quality=None,
-                pixelformat=codec_config["pixel_format"],
-                output_params=codec_config["output_params"],
-                macro_block_size=1
-            )
-            
-            logger.info(f"Video writer initialized: {codec_config['description']}")
-            logger.info(f"Output: {write_path} ({self.width}x{self.height} @ {self.fps}fps)")
-            
-        except Exception as e:
-            logger.error(f"Failed to initialize video writer: {e}")
-            raise
-    
-    def write_frame(self, frame: torch.Tensor) -> Optional[np.ndarray]:
-        if not NUMPY_AVAILABLE:
-            raise RuntimeError("numpy required")
-        
-        frame_np = (frame * 255.0).clamp(0, 255).byte().cpu().numpy()
-        
-        self.writer.append_data(frame_np)
-        self.frames_written += 1
-        
-        preview = None
-        if self.frames_written % StreamingVideoConfig.PREVIEW_INTERVAL == 0:
-            scale = min(1.0, 512.0 / max(self.width, self.height))
-            
-            if scale < 1.0:
-                if CV2_AVAILABLE:
-                    new_w = int(self.width * scale)
-                    new_h = int(self.height * scale)
-                    preview = cv2.resize(frame_np, (new_w, new_h), interpolation=cv2.INTER_AREA)
-            else:
-                preview = frame_np.copy()
-            
-            self.last_preview = preview
-        
-        if self.frames_written % StreamingVideoConfig.METADATA_SAVE_INTERVAL == 0:
-            self._save_metadata()
-        
-        return preview
-    
-    def _save_metadata(self):
-        metadata = {
-            "frames_written": self.frames_written,
-            "output_path": self.output_path,
-            "temp_path": self.temp_path,
-            "fps": self.fps,
-            "codec": self.codec,
-            "resolution": [self.width, self.height],
-            "timestamp": time.time()
-        }
-        
-        try:
-            with open(self.metadata_path, 'w') as f:
-                json.dump(metadata, f, indent=2)
-        except Exception as e:
-            logger.debug(f"Metadata save failed: {e}")
-    
-    def _load_metadata(self):
-        try:
-            with open(self.metadata_path, 'r') as f:
-                metadata = json.load(f)
-            
-            self.frames_written = metadata.get("frames_written", 0)
-            logger.info(f"Resuming from frame {self.frames_written}")
-            
-        except Exception as e:
-            logger.warning(f"Metadata load failed: {e}")
-            self.frames_written = 0
-    
-    def finalize(self, audio_path: Optional[str] = None) -> str:
-        if self.writer:
-            self.writer.close()
-            self.writer = None
-        
-        if os.path.exists(self.metadata_path):
-            try:
-                os.remove(self.metadata_path)
-            except:
-                pass
-        
-        temp_exists = os.path.exists(self.temp_path)
-        
-        if not temp_exists:
-            if audio_path and os.path.exists(audio_path):
-                final_path = self._mux_audio(self.output_path, audio_path)
-                return final_path
-            return self.output_path
-        
-        if audio_path and os.path.exists(audio_path):
-            final_path = self._mux_audio(self.temp_path, audio_path)
-            if final_path == self.temp_path:
-                try:
-                    os.replace(self.temp_path, self.output_path)
-                except:
-                    pass
-                return self.output_path
-            return final_path
-        else:
-            try:
-                os.replace(self.temp_path, self.output_path)
-            except Exception as e:
-                logger.error(f"Failed to move temp file: {e}")
-                return self.temp_path
-            return self.output_path
-    
-    def _mux_audio(self, video_path: str, audio_path: str) -> str:
-        if not os.path.exists(video_path):
-            logger.error(f"Video file not found: {video_path}")
-            return video_path
-        
-        if not os.path.exists(audio_path):
-            logger.error(f"Audio file not found: {audio_path}")
-            return video_path
-        
-        try:
-            import imageio_ffmpeg
-            ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-        except ImportError:
-            ffmpeg_exe = "ffmpeg"
-        
-        base, ext = os.path.splitext(self.output_path)
-        output_with_audio = f"{base}_audio{ext}"
-        
-        codec_config = StreamingVideoConfig.CODECS.get(self.codec, StreamingVideoConfig.CODECS["h264"])
-        
-        try:
-            cmd = [
-                ffmpeg_exe, "-y",
-                "-i", video_path,
-                "-i", audio_path,
-                "-map", "0:v:0",
-                "-map", "1:a:0",
-                "-c:v", codec_config["codec"],
-            ]
-            
-            cmd.extend(codec_config["output_params"])
-            cmd.extend([
-                "-pix_fmt", codec_config["pixel_format"],
-                "-c:a", "aac",
-                "-b:a", "192k",
-                "-shortest",
-                output_with_audio
-            ])
-            
-            logger.info(f"Running ffmpeg mux: {' '.join(cmd)}")
-            
-            result = subprocess.run(
-                cmd,
-                check=True,
-                capture_output=True,
-                timeout=600,
-                text=True
-            )
-            
-            if os.path.exists(output_with_audio):
-                try:
-                    if video_path != self.output_path:
-                        os.remove(video_path)
-                        logger.info(f"Removed temp video: {video_path}")
-                except Exception as e:
-                    logger.debug(f"Could not remove temp video: {e}")
-                
-                logger.info(f"✓ Audio muxed: {output_with_audio}")
-                return output_with_audio
-            else:
-                logger.error("FFmpeg succeeded but output not created")
-                return video_path
-                
-        except Exception as e:
-            logger.error(f"FFmpeg mux error: {e}")
-            return video_path
-    
-    def __del__(self):
-        if self.writer:
-            try:
-                self.writer.close()
-            except Exception:
-                pass
-
-
-class UniversalSmartVAEVideoDecode:
+class UniversalSmartVAEDecode:
     """
-    Standalone streaming video decode node with warning ignore option.
+    Production-grade VAE decoder with disk offloading and safety overrides.
+    
+    Features:
+    - Handles 2000+ frames with automatic memory management
+    - Disk offload when RAM insufficient
+    - Frame-perfect audio sync (if integrated downstream)
+    - Multi-stage OOM recovery
+    - NEW: Ignore warnings for corrupted latents (risk of black frames)
     """
     
     MAX_OOM_RETRIES = 5
+    DISK_MERGE_CHUNK_SIZE = 10
     
     @classmethod
     def INPUT_TYPES(cls):
@@ -356,7 +66,7 @@ class UniversalSmartVAEVideoDecode:
                     "min": 1,
                     "max": 128,
                     "step": 1,
-                    "tooltip": "Frames per decode batch. Auto-reduces on OOM."
+                    "tooltip": "Frames to decode per batch. Auto-reduces on OOM."
                 }),
             },
             "optional": {
@@ -372,73 +82,69 @@ class UniversalSmartVAEVideoDecode:
                     "min": 0,
                     "max": 16,
                     "step": 1,
-                    "tooltip": "Manual override (0=auto). E.g., 8 for LTX-Video."
+                    "tooltip": "Manual time scale override (0=auto). E.g., 8 for LTX-Video."
                 }),
                 "enable_tiling": ("BOOLEAN", {
                     "default": False,
-                    "tooltip": "Force tiling. Auto-enables on OOM."
+                    "tooltip": "Force spatial tiling. Auto-enables on OOM."
                 }),
                 "tile_size": ("INT", {
                     "default": 512,
                     "min": 256,
                     "max": 2048,
                     "step": 64,
-                    "tooltip": "Tile size in pixels."
+                    "tooltip": "Tile size in pixels for spatial tiling."
                 }),
                 "verbose": ("BOOLEAN", {
                     "default": False,
-                    "tooltip": "Show detailed logs."
+                    "tooltip": "Show detailed progress logs."
                 }),
-                "video_output_path": ("STRING", {
-                    "default": "",
-                    "multiline": False,
-                    "tooltip": "Output path. Empty = auto-generated."
-                }),
-                "fps": ("INT", {
-                    "default": 24,
-                    "min": 1,
-                    "max": 120,
-                    "step": 1,
-                    "tooltip": "Frames per second"
-                }),
-                "codec": (list(StreamingVideoConfig.CODECS.keys()), {
-                    "default": "h264",
-                    "tooltip": "h264=compatible | h265=smaller | prores/ffv1=professional"
-                }),
-                "audio_path": ("STRING", {
-                    "default": "",
-                    "multiline": False,
-                    "tooltip": "Optional audio file path to mux (alternative to AUDIO input)"
-                }),
-                "audio": ("AUDIO", {
-                    "tooltip": "Optional AUDIO input (ComfyUI format). Priority over audio_path."
-                }),
-                "resume_on_crash": ("BOOLEAN", {
-                    "default": True,
-                    "tooltip": "Resume if crash occurred"
+                "max_ram_frames": ("INT", {
+                    "default": 500,
+                    "min": 100,
+                    "max": 10000,
+                    "step": 100,
+                    "tooltip": "Threshold for disk offload. Tune to system RAM: 16GB=300, 32GB=600, 64GB=1000."
                 }),
                 "ignore_warnings": (["none", "minor", "all"], {
                     "default": "none",
                     "tooltip": (
-                        "Warning handling mode:\n"
-                        "• none = Stop on any issue (safest)\n"
-                        "• minor = Continue if corruption <10% (partial black frames possible)\n"
-                        "• all = Force decode anyway (high risk of black frames or crash)"
+                        "Corrupted latent handling:\n"
+                        "• none = Stop on NaN/corruption (safest)\n"
+                        "• minor = Try if <10% corrupt (may produce black frames)\n"
+                        "• all = Force decode anyway (high crash/black frames risk)"
                     )
                 }),
             }
         }
 
-    RETURN_TYPES = ("IMAGE", "STRING")
-    RETURN_NAMES = ("preview_thumbs", "video_path")
+    RETURN_TYPES = ("IMAGE",)
     FUNCTION = "decode"
-    OUTPUT_NODE = True
     CATEGORY = "latent/video"
 
     def __init__(self):
         self._time_scale_cache = {}
         self._force_scale_cache = {}
+        self.temp_dir = None
         self._verbose = False
+        
+        atexit.register(self._cleanup_temp_dir)
+
+    def _cleanup_temp_dir(self):
+        if self.temp_dir and os.path.exists(self.temp_dir):
+            try:
+                for file in os.listdir(self.temp_dir):
+                    try:
+                        os.remove(os.path.join(self.temp_dir, file))
+                    except Exception as e:
+                        logger.debug(f"Failed to remove temp file: {e}")
+                os.rmdir(self.temp_dir)
+                logger.debug(f"Cleaned up temp dir: {self.temp_dir}")
+            except Exception as e:
+                logger.debug(f"Temp dir cleanup error: {e}")
+
+    def __del__(self):
+        self._cleanup_temp_dir()
 
     def _get_available_vram(self) -> Optional[float]:
         try:
@@ -447,7 +153,7 @@ class UniversalSmartVAEVideoDecode:
             free_vram, _ = torch.cuda.mem_get_info(torch.cuda.current_device())
             return free_vram / (1024 ** 3)
         except Exception as e:
-            logger.warning(f"VRAM detection failed: {e}")
+            logger.warning(f"Failed to get VRAM info: {e}")
             return None
 
     def _get_available_ram(self) -> Optional[float]:
@@ -455,21 +161,8 @@ class UniversalSmartVAEVideoDecode:
             try:
                 return psutil.virtual_memory().available / (1024 ** 3)
             except Exception as e:
-                logger.warning(f"RAM detection failed: {e}")
+                logger.warning(f"Failed to get RAM info: {e}")
         return None
-
-    def _estimate_chunk_vram(self, frames: int, channels: int, h: int, w: int, 
-                            time_scale: int = 1) -> float:
-        spatial_scale = 8
-        latent_bytes = frames * channels * h * w * 4
-        output_frames = frames * time_scale
-        output_bytes = output_frames * 3 * (h * spatial_scale) * (w * spatial_scale) * 4
-        total_bytes = (latent_bytes + output_bytes) * 3.5 * 1.1
-        return total_bytes / (1024 ** 3)
-
-    def _estimate_output_ram(self, expected_frames: int, output_h: int, output_w: int) -> float:
-        bytes_per_frame = output_h * output_w * 3 * 4
-        return (expected_frames * bytes_per_frame) / (1024 ** 3)
 
     def detect_time_scale(self, vae, latents: torch.Tensor, force_scale: int = 0, 
                           verbose: bool = True) -> int:
@@ -539,36 +232,54 @@ class UniversalSmartVAEVideoDecode:
             self._time_scale_cache[vae_id] = 1
             return 1
 
-    def detect_output_size(self, vae, latents, h_latent, w_latent, tile_size, verbose):
-        test_latent = latents[:, :, :1, :, :]
+    def detect_output_size(self, vae, latents: torch.Tensor, h_latent: int, w_latent: int, 
+                           tile_size: int = 512, verbose: bool = True) -> Tuple[int, int]:
+        aspect_ratio = h_latent / float(w_latent)
+        test_sample = latents[:, :, 0:1, :, :]
         
         try:
             with torch.no_grad():
-                if hasattr(vae, 'decode_tiled'):
-                    test_out = vae.decode_tiled(test_latent, tile_x=tile_size, tile_y=tile_size)
-                else:
-                    test_out = vae.decode(test_latent)
-                
-                test_out = self._normalize_output(test_out, aspect_ratio=None)
-                
-                output_h = test_out.shape[1]
-                output_w = test_out.shape[2]
-                
-                if verbose:
-                    logger.info(f"   Detected output: {output_h}×{output_w}")
-                
-                return output_h, output_w
-        
-        except Exception as e:
-            logger.warning(f"Could not decode test frame ({e}), using estimated size")
-            
-            output_h = h_latent * 8
-            output_w = w_latent * 8
-            
+                test_out = vae.decode(test_sample)
             if verbose:
-                logger.info(f"   Estimated output: {output_h}×{output_w}")
-            
-            return output_h, output_w
+                logger.info("🔍 Output size detected (standard)")
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                gc.collect()
+                
+                try:
+                    with torch.no_grad():
+                        test_out = vae.decode_tiled(test_sample, tile_x=tile_size, tile_y=tile_size)
+                    if verbose:
+                        logger.info("🔍 Output size detected (tiled)")
+                except Exception as inner_e:
+                    raise RuntimeError("Failed to detect output size even with tiling.") from inner_e
+            else:
+                raise
+        
+        test_out = self._normalize_output(test_out, aspect_ratio)
+        output_h, output_w = test_out.shape[1:3]
+        
+        del test_out, test_sample
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
+        
+        return output_h, output_w
+
+    def _estimate_chunk_vram(self, frames: int, channels: int, h: int, w: int, 
+                            time_scale: int = 1) -> float:
+        spatial_scale = 8
+        latent_bytes = frames * channels * h * w * 4
+        output_frames = frames * time_scale
+        output_bytes = output_frames * 3 * (h * spatial_scale) * (w * spatial_scale) * 4
+        total_bytes = (latent_bytes + output_bytes) * 3.5 * 1.1
+        return total_bytes / (1024 ** 3)
+
+    def _estimate_output_ram(self, expected_frames: int, output_h: int, output_w: int) -> float:
+        bytes_per_frame = output_h * output_w * 3 * 4
+        return (expected_frames * bytes_per_frame) / (1024 ** 3)
 
     def _normalize_output(self, tensor, aspect_ratio: Optional[float] = None) -> torch.Tensor:
         if isinstance(tensor, (list, tuple)):
@@ -656,331 +367,183 @@ class UniversalSmartVAEVideoDecode:
         return tensor[:, h_offset:h_offset + h_ref, w_offset:w_offset + w_ref, :]
 
     def decode(self, vae, samples, frames_per_batch, overlap_frames=2, force_time_scale=0, 
-               enable_tiling=False, tile_size=512, verbose=False,
-               video_output_path="", fps=24, codec="h264", audio_path="", audio=None, 
-               resume_on_crash=True, ignore_warnings="none"):
+               enable_tiling=False, tile_size=512, verbose=True, max_ram_frames=500,
+               ignore_warnings="none"):
+        """
+        Main decode with disk offloading, OOM protection and corrupted latent override.
+        """
         self._verbose = verbose
-        
-        if not IMAGEIO_AVAILABLE or not NUMPY_AVAILABLE:
-            raise RuntimeError(
-                "Required dependencies missing.\n"
-                "Install: pip install imageio imageio-ffmpeg numpy"
-            )
         
         latents = samples["samples"]
         
+        # ======== IMAGE PATH ========
+        # ======== IMAGE PATH ========
         if latents.dim() == 4:
-            raise ValueError(
-                "This node is for video latents only (5D tensors).\n"
-                "For images (4D), use standard VAE Decode node."
-            )
-        
+            if verbose:
+                logger.info("🖼️  Image decode (4D latent)")
+            
+            try:
+                with torch.no_grad():
+                    if enable_tiling and hasattr(vae, 'decode_tiled'):
+                        output = vae.decode_tiled(latents, tile_x=tile_size, tile_y=tile_size)
+                    else:
+                        output = vae.decode(latents)
+                
+                output = self._normalize_output(output, aspect_ratio=1.0)
+                
+                if verbose:
+                    logger.info(f"✅ Image decode complete: {output.shape}")
+                
+                return (output,)
+            
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower():
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    gc.collect()
+                    
+                    if not enable_tiling and hasattr(vae, 'decode_tiled'):
+                        logger.warning("OOM during image decode - retrying with tiling")
+                        with torch.no_grad():
+                            output = vae.decode_tiled(latents, tile_x=tile_size, tile_y=tile_size)
+                        output = self._normalize_output(output, aspect_ratio=1.0)
+                        
+                        if verbose:
+                            logger.info(f"✅ Image decode complete (tiled fallback): {output.shape}")
+                        
+                        return (output,)
+                    else:
+                        logger.error("OOM during image decode - tiling already enabled or unavailable")
+                raise
+                
+        # ======== VIDEO PATH ========
         batch, channels, total_frames, h_latent, w_latent = latents.shape
         
         if total_frames <= 0:
             raise ValueError("Latent has no frames")
         
+        if verbose:
+            logger.info("🔍 Validating latent...")
+        
+        # ============= LATENT VALIDATION + IGNORE WARNINGS =============
+        if torch.isnan(latents).any():
+            nan_count = torch.isnan(latents).sum().item()
+            total_elements = latents.numel()
+            nan_percent = (nan_count / total_elements) * 100
+            
+            logger.error("=" * 70)
+            logger.error("🚨 CORRUPTED LATENT DETECTED!")
+            logger.error(f"   NaN values: {nan_count:,} / {total_elements:,} ({nan_percent:.2f}%)")
+            logger.error(f"   Shape: {latents.shape}")
+            
+            nan_frames = torch.isnan(latents).any(dim=(0,1,3,4)).nonzero(as_tuple=True)[0]
+            if len(nan_frames) > 0:
+                first_bad = nan_frames[0].item()
+                last_bad = nan_frames[-1].item()
+                logger.error(f"   Affected frames: {first_bad} to {last_bad}")
+                logger.error(f"   → Corruption likely started around frame {first_bad}")
+            
+            logger.error("")
+            logger.error("💊 RECOMMENDED FIXES:")
+            logger.error("   1. REDUCE VIDEO LENGTH (most effective)")
+            logger.error(f"      Current: {total_frames} frames → try {int(total_frames * 0.6)}")
+            logger.error("   2. REDUCE RESOLUTION")
+            logger.error("   3. Lower CFG scale (e.g. 3.5 instead of 7.0)")
+            logger.error("   4. Use TensorParallel or Kijaji nodes")
+            logger.error("   5. Clear VRAM before sampling")
+            logger.error("=" * 70)
+            
+            if ignore_warnings == "none":
+                raise ValueError(
+                    f"Latent contains {nan_percent:.1f}% NaN values - cannot decode safely.\n"
+                    f"The sampler ran out of VRAM.\n\n"
+                    f"To force decode anyway (may produce black frames):\n"
+                    f"  Set 'ignore_warnings' to 'minor' (<10%) or 'all' (risky)"
+                )
+            
+            elif ignore_warnings == "minor":
+                if nan_percent > 10.0:
+                    raise ValueError(
+                        f"Latent is {nan_percent:.1f}% corrupted (limit: 10% for 'minor' mode).\n"
+                        f"This is too severe - output would be mostly black.\n\n"
+                        f"Options:\n"
+                        f"  1. Reduce video length/resolution and re-sample\n"
+                        f"  2. Set 'ignore_warnings' to 'all' (not recommended)"
+                    )
+                
+                logger.warning("=" * 70)
+                logger.warning("⚠️ CONTINUING WITH CORRUPTED LATENT (user override)")
+                logger.warning(f"   Corruption: {nan_percent:.2f}% (under 10% threshold)")
+                logger.warning(f"   Frames {first_bad}-{last_bad} will likely be BLACK")
+                logger.warning("   Rest of video may be OK")
+                logger.warning("=" * 70)
+                
+                latents = torch.nan_to_num(latents, nan=0.0, posinf=1.0, neginf=0.0)
+            
+            elif ignore_warnings == "all":
+                logger.error("=" * 70)
+                logger.error("🚨 FORCING DECODE WITH SEVERELY CORRUPTED LATENT!")
+                logger.error(f"   Corruption: {nan_percent:.2f}%")
+                logger.error("   ⚠️ WARNING: Output will likely be:")
+                logger.error("      • Mostly/entirely BLACK")
+                logger.error("      • May CRASH during decode")
+                logger.error("      • Waste time and produce unusable file")
+                logger.error("")
+                logger.error("   You have been warned. Proceeding anyway...")
+                logger.error("=" * 70)
+                
+                latents = torch.nan_to_num(latents, nan=0.0, posinf=1.0, neginf=0.0)
+        
+        if torch.isinf(latents).any():
+            raise ValueError("Latent contains Inf values - upstream overflow!")
+        
+        if verbose:
+            logger.info("✓ Latent validation passed")
+        # ===============================================================
+
+        # Detect scales
         time_scale = self.detect_time_scale(vae, latents, force_time_scale, verbose)
         expected_frames = 1 + (total_frames - 1) * time_scale
         aspect_ratio = h_latent / float(w_latent)
         
+        # Detect output size
         output_h, output_w = self.detect_output_size(vae, latents, h_latent, w_latent, tile_size, verbose)
         
+        # RAM estimation
         est_ram = self._estimate_output_ram(expected_frames, output_h, output_w)
-        if verbose:
-            logger.info(f"   Estimated full-RAM usage (if not streaming): {est_ram:.2f}GB")
+        available_ram = self._get_available_ram()
         
-        if not video_output_path:
-            output_dir = folder_paths.get_output_directory()
-            timestamp = int(time.time())
-            codec_ext = StreamingVideoConfig.CODECS[codec]["ext"]
-            video_output_path = os.path.join(output_dir, f"video_{timestamp}.{codec_ext}")
-        
-        os.makedirs(os.path.dirname(video_output_path) or ".", exist_ok=True)
-        
-        temp_audio_path = None
-        final_audio_path = audio_path
-        
-        if audio is not None:
-            try:
-                if not isinstance(audio, dict) or 'waveform' not in audio or 'sample_rate' not in audio:
-                    logger.warning(f"Invalid AUDIO format. Got: {type(audio)}")
-                else:
-                    waveform = audio['waveform']
-                    sample_rate = audio['sample_rate']
-                    
-                    if waveform is None or sample_rate is None:
-                        logger.error("AUDIO input missing 'waveform' or 'sample_rate'")
-                    elif waveform.numel() == 0:
-                        logger.error("AUDIO input waveform is empty")
-                    else:
-                        if isinstance(waveform, torch.Tensor):
-                            waveform = waveform.cpu()
-                        
-                        if waveform.dim() == 1:
-                            waveform = waveform.unsqueeze(0)
-                        elif waveform.dim() == 3:
-                            waveform = waveform.squeeze(0)
-                        
-                        timestamp = int(time.time() * 1000)
-                        temp_audio_path = os.path.join(
-                            folder_paths.get_temp_directory(), 
-                            f"temp_audio_{timestamp}_{os.getpid()}.wav"
-                        )
-                        
-                        try:
-                            import imageio_ffmpeg
-                            ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-                        except ImportError:
-                            ffmpeg_exe = "ffmpeg"
-                        
-                        waveform_np = (waveform.numpy() * 32767).astype('int16')
-                        channels = waveform_np.shape[0]
-                        
-                        cmd = [
-                            ffmpeg_exe, "-y",
-                            "-f", "s16le",
-                            "-ar", str(sample_rate),
-                            "-ac", str(channels),
-                            "-i", "pipe:0",
-                            "-c:a", "pcm_s16le",
-                            temp_audio_path
-                        ]
-                        
-                        process = subprocess.Popen(
-                            cmd,
-                            stdin=subprocess.PIPE,
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE
-                        )
-                        
-                        stdout, stderr = process.communicate(input=waveform_np.T.tobytes())
-                        
-                        if process.returncode != 0:
-                            raise RuntimeError(f"FFmpeg failed: {stderr.decode()}")
-                        
-                        final_audio_path = temp_audio_path
-                        
-                        if verbose:
-                            logger.info(f"✓ AUDIO saved (ffmpeg): {temp_audio_path}")
-            except Exception as e:
-                logger.warning(f"Failed to process AUDIO input: {e}")
-                temp_audio_path = None
-        
-        if final_audio_path and os.path.exists(final_audio_path):
-            logger.info(f"🔊 Audio source ready: {final_audio_path}")
-        elif final_audio_path:
-            logger.warning(f"Audio path specified but file not found: {final_audio_path}")
-            final_audio_path = ""
-        
-        logger.info("🎬 STREAMING VIDEO DECODE")
-        logger.info(f"   Output: {video_output_path}")
-        logger.info(f"   Codec: {codec} @ {fps}fps")
-        logger.info(f"   Resolution: {output_h}x{output_w}")
-        logger.info(f"   Expected frames: ~{expected_frames}")
-        if final_audio_path:
-            logger.info(f"   Audio source: {final_audio_path}")
-        if ignore_warnings != "none":
-            logger.warning(f"⚠️ Ignore warnings mode: {ignore_warnings} (risk of black frames)")
-        
-        try:
-            return self._streaming_decode(
-                vae, latents, video_output_path, fps, codec, final_audio_path,
-                resume_on_crash, frames_per_batch, overlap_frames,
-                force_time_scale, enable_tiling, tile_size, verbose,
-                time_scale, expected_frames, aspect_ratio, output_h, output_w,
-                h_latent, w_latent, channels, ignore_warnings
-            )
-        finally:
-            if temp_audio_path and os.path.exists(temp_audio_path):
-                for attempt in range(5):
-                    try:
-                        time.sleep(0.5)
-                        os.remove(temp_audio_path)
-                        if verbose:
-                            logger.info(f"✓ Cleaned temp audio: {temp_audio_path}")
-                        break
-                    except Exception as e:
-                        if attempt == 4:
-                            logger.warning(f"Could not remove temp audio: {e}")
-                        continue
-
-    def _streaming_decode(self, vae, latents, video_output_path, fps, codec, audio_path,
-                          resume_on_crash, frames_per_batch, overlap_frames,
-                          force_time_scale, enable_tiling, tile_size, verbose,
-                          time_scale, expected_frames, aspect_ratio, output_h, output_w,
-                          h_latent, w_latent, channels, ignore_warnings="none"):
-        """Streaming decode implementation with warning ignore."""
-        
-        batch, _, total_frames, _, _ = latents.shape
-        
-        if verbose:
-            logger.info("🔍 Validating latent before decode...")
-        
-        try:
-            _ = latents[0, 0, 0, 0, 0].item()
-            
-            if torch.isnan(latents).any():
-                nan_count = torch.isnan(latents).sum().item()
-                total_elements = latents.numel()
-                nan_percent = (nan_count / total_elements) * 100
-                
-                logger.error("=" * 70)
-                logger.error("🚨 CORRUPTED LATENT DETECTED!")
-                logger.error(f"   NaN values: {nan_count:,} / {total_elements:,} ({nan_percent:.2f}%)")
-                logger.error(f"   Shape: {latents.shape}")
-                
-                nan_frames = torch.isnan(latents).any(dim=(0,1,3,4)).nonzero(as_tuple=True)[0]
-                if len(nan_frames) > 0:
-                    first_bad = nan_frames[0].item()
-                    last_bad = nan_frames[-1].item()
-                    logger.error(f"   Affected frames: {first_bad} to {last_bad}")
-                    logger.error(f"   → Corruption likely started around frame {first_bad}")
-                
-                logger.error("")
-                logger.error("💊 RECOMMENDED FIXES:")
-                logger.error("   1. REDUCE VIDEO LENGTH (most effective)")
-                logger.error(f"      Current: {total_frames} frames → try {int(total_frames * 0.6)}")
-                logger.error("   2. REDUCE RESOLUTION")
-                logger.error("   3. Lower CFG scale (e.g. 3.5 instead of 7.0)")
-                logger.error("   4. Enable CPU offload or tiled sampling")
-                logger.error("   5. Clear VRAM before workflow")
-                logger.error("=" * 70)
-                
-                if ignore_warnings == "none":
-                    raise ValueError(
-                        f"Latent contains {nan_percent:.1f}% NaN values - cannot decode safely.\n"
-                        "To force decode anyway (may produce black frames):\n"
-                        "  Set 'ignore_warnings' to 'minor' (<10% corruption) or 'all' (high risk)"
-                    )
-                
-                elif ignore_warnings == "minor":
-                    if nan_percent > 10.0:
-                        raise ValueError(
-                            f"Latent is {nan_percent:.1f}% corrupted (limit: 10% for 'minor' mode).\n"
-                            "This is too severe - output would be mostly black.\n\n"
-                            "Options:\n"
-                            "  1. Reduce video length/resolution and re-sample\n"
-                            "  2. Set 'ignore_warnings' to 'all' (not recommended)"
-                        )
-                    
-                    logger.warning("=" * 70)
-                    logger.warning("⚠️ CONTINUING WITH PARTIALLY CORRUPTED LATENT (user override)")
-                    logger.warning(f"   Corruption level: {nan_percent:.2f}% (under 10% threshold)")
-                    logger.warning(f"   Affected frames {first_bad}-{last_bad} will likely be BLACK")
-                    logger.warning("   The rest of the video may be OK")
-                    logger.warning("=" * 70)
-                    
-                    latents = torch.nan_to_num(latents, nan=0.0, posinf=1.0, neginf=0.0)
-                
-                elif ignore_warnings == "all":
-                    logger.error("=" * 70)
-                    logger.error("🚨 FORCING DECODE WITH SEVERELY CORRUPTED LATENT!")
-                    logger.error(f"   Corruption: {nan_percent:.2f}%")
-                    logger.error("   ⚠️ WARNING: Output will likely be:")
-                    logger.error("      • Mostly/entirely BLACK")
-                    logger.error("      • May CRASH during decode")
-                    logger.error("      • Waste time and produce unusable file")
-                    logger.error("")
-                    logger.error("   You have been warned. Proceeding anyway...")
-                    logger.error("=" * 70)
-                    
-                    latents = torch.nan_to_num(latents, nan=0.0, posinf=1.0, neginf=0.0)
-            
-            if torch.isinf(latents).any():
-                raise ValueError("❌ Latent contains Inf - upstream overflow!")
-            
-            if latents.numel() == 0:
-                raise ValueError("❌ Latent is empty - upstream allocation failed!")
-            
-            if verbose:
-                min_val = latents.min().item()
-                max_val = latents.max().item()
-                logger.info(f"   ✓ Latent range: [{min_val:.4f}, {max_val:.4f}]")
-                logger.info(f"   ✓ Shape: {latents.shape}, Device: {latents.device}")
-        
-        except RuntimeError as e:
-            error_msg = str(e).lower()
-            if "cuda" in error_msg or "memory" in error_msg or "out of memory" in error_msg:
-                logger.error("=" * 70)
-                logger.error("🚨 SILENT OOM DETECTED IN UPSTREAM NODE (SAMPLER)!")
-                logger.error(f"   Latent shape: {latents.shape}")
-                logger.error(f"   Expected size: ~{(latents.numel() * 4 / 1024**3):.2f} GB")
-                logger.error(f"   Device: {latents.device}")
-                logger.error(f"   Error: {e}")
-                logger.error("=" * 70)
-                logger.error("💡 ROOT CAUSE: The sampler ran out of VRAM without throwing error.")
-                logger.error("   The latent is CORRUPTED and cannot be decoded properly.")
-                logger.error("")
-                logger.error("💊 SOLUTIONS:")
-                logger.error("   1. REDUCE VIDEO LENGTH (most effective)")
-                logger.error("   2. REDUCE RESOLUTION")
-                logger.error("   3. Lower CFG scale")
-                logger.error("   4. Enable CPU offload or tiled sampling")
-                logger.error("   5. Clear VRAM before workflow")
-                logger.error("=" * 70)
-                
-                logger.warning("⚠️ Attempting emergency CPU recovery...")
-                try:
-                    latents = latents.cpu()
-                    vae.first_stage_model.to('cpu')
-                    logger.info("   ✓ Moved to CPU - decode will be SLOW but may work")
-                    logger.info("   ⚠️ If you get black frames, the latent is too corrupted")
-                except Exception as recovery_error:
-                    raise RuntimeError(
-                        f"Latent is corrupted beyond recovery.\n"
-                        f"Original error: {e}\n"
-                        f"Recovery failed: {recovery_error}\n\n"
-                        f"You MUST reduce video length or resolution."
-                    ) from e
-            else:
-                raise
-        
-        # 2. Info o frame conversion (nie warning!)
-        if verbose and expected_frames is not None:
-            logger.info(f"📊 Frame conversion:")
-            logger.info(f"   Latent frames: {total_frames}")
-            logger.info(f"   Time scale: {time_scale}x")
-            logger.info(f"   Output frames: ~{expected_frames} ({expected_frames/24:.1f}s @ 24fps)")
-        
-        if total_frames > 1000:
-            original_batch = frames_per_batch
-            
-            if total_frames > 2000:
-                safe_batch = 4
-            elif total_frames > 1500:
-                safe_batch = 6
-            else:
-                safe_batch = 8
-            
-            if frames_per_batch > safe_batch:
-                frames_per_batch = safe_batch
-                if verbose:
-                    logger.info("=" * 70)
-                    logger.info(f"🛡️ LONG SEQUENCE DETECTED: {total_frames} frames")
-                    logger.info(f"   Auto-reducing batch: {original_batch} → {frames_per_batch}")
-                    logger.info(f"   (Prevents NaN accumulation in VAE)")
-                    logger.info("=" * 70)
-        
-        if total_frames > 2500 and latents.device.type == 'cuda':
-            logger.warning("=" * 70)
-            logger.warning(f"🚨 MEGA-SEQUENCE: {total_frames} frames")
-            logger.warning("   Forcing FULL CPU DECODE to prevent crash")
-            logger.warning("   This will be VERY SLOW (~10x slower)")
-            logger.warning("=" * 70)
-            
-            latents = latents.cpu()
-            vae.first_stage_model.to('cpu')
-            frames_per_batch = min(frames_per_batch, 4)
-            gc.collect()
-            torch.cuda.empty_cache()
-        
-        if verbose:
-            logger.info("✓ Latent validation complete")
-        
-        writer = StreamingVideoWriter(
-            video_output_path, fps, codec, output_h, output_w, resume=resume_on_crash
+        use_disk_offload = (
+            expected_frames > max_ram_frames or
+            (available_ram is not None and est_ram > available_ram * 0.5)
         )
+        
+        if use_disk_offload:
+            self.temp_dir = tempfile.mkdtemp(prefix="comfy_smartvae_")
+            if verbose:
+                logger.info(f"💾 Disk offload enabled ({expected_frames} frames, est {est_ram:.2f}GB RAM)")
+        
+        if verbose:
+            logger.info(f"🎬 Video decode:")
+            logger.info(f"   Input: {total_frames} latent frames")
+            logger.info(f"   Time scale: {time_scale}x")
+            logger.info(f"   Expected output: ~{expected_frames} frames")
+            logger.info(f"   Output resolution: {output_h}x{output_w}")
+            logger.info(f"   Estimated RAM: {est_ram:.2f}GB")
+            
+            if available_ram:
+                ram_pct = (est_ram / available_ram) * 100
+                logger.info(f"   RAM usage: {ram_pct:.1f}% of {available_ram:.1f}GB available")
+            
+            orientation = 'portrait' if aspect_ratio < 1.0 else 'landscape'
+            logger.info(f"   Aspect ratio: {aspect_ratio:.3f} ({orientation})")
+            logger.info(f"   Mode: {'💾 Disk offload' if use_disk_offload else '🚀 In-memory (pinned)'}")
+            
+            if est_ram > 16:
+                warnings.warn(
+                    f"High RAM usage ({est_ram:.1f}GB). "
+                    f"Consider lowering resolution or increasing max_ram_frames."
+                )
         
         frames_per_batch = max(1, min(frames_per_batch, total_frames))
         overlap_frames = max(0, min(overlap_frames, frames_per_batch - 1))
@@ -998,32 +561,73 @@ class UniversalSmartVAEVideoDecode:
                 overlap_frames = min(overlap_frames, frames_per_batch - 1)
                 
                 if verbose:
-                    logger.info(f"📉 VRAM reduction: {old_batch} → {frames_per_batch}")
+                    logger.info(f"📉 Predictive VRAM reduction:")
+                    logger.info(f"   Batch: {old_batch} → {frames_per_batch}")
+                    logger.info(f"   Est: {est_vram:.2f}GB / Avail: {available_vram:.2f}GB")
         
         if verbose:
-            logger.info(f"   Batch: {frames_per_batch}, Overlap: {overlap_frames}")
+            logger.info(f"   Batch size: {frames_per_batch}")
+            logger.info(f"   Overlap: {overlap_frames} frames")
+        
+        temp_files = [] if use_disk_offload else None
+        final_output = None
+        current_write_idx = 0
+        
+        if not use_disk_offload:
+            try:
+                final_output = torch.empty(
+                    expected_frames, output_h, output_w, 3,
+                    dtype=torch.float32,
+                    device='cpu',
+                    pin_memory=torch.cuda.is_available()
+                )
+                if verbose:
+                    logger.info("   ✓ Pre-allocated pinned memory")
+            except Exception as e:
+                if verbose:
+                    logger.warning(f"Pre-allocation failed: {e}")
+                    logger.info("→ Falling back to disk offload")
+                use_disk_offload = True
+                self.temp_dir = tempfile.mkdtemp(prefix="comfy_smartvae_")
+                temp_files = []
         
         current_batch = frames_per_batch
-        start_idx = writer.frames_written if resume_on_crash else 0
+        start_idx = 0
         frames_processed = 0
         last_frames_processed = -1
         stagnation_count = 0
         MAX_STAGNATION = 3
+        cumulative_output_frames = 0
         oom_retry_count = 0
         
         pbar = comfy.utils.ProgressBar(total_frames)
-        preview_frames = []
+        
+        est_total_chunks = math.ceil(total_frames / frames_per_batch)
+        log_every_n = 5 if est_total_chunks > 20 else 1
+        chunk_count = 0
         
         while start_idx < total_frames:
             throw_exception_if_processing_interrupted()
             
             if oom_retry_count >= self.MAX_OOM_RETRIES:
-                raise RuntimeError(f"Exceeded {self.MAX_OOM_RETRIES} OOM retries")
+                raise RuntimeError(
+                    f"Exceeded maximum OOM retries ({self.MAX_OOM_RETRIES}).\n"
+                    f"Current settings: batch={current_batch}, tile={tile_size}, tiling={enable_tiling}\n"
+                    f"This indicates insufficient VRAM for this workflow.\n\n"
+                    f"Suggestions:\n"
+                    f"  1. Reduce latent resolution\n"
+                    f"  2. Close other GPU applications\n"
+                    f"  3. Process video in smaller segments"
+                )
             
             if frames_processed == last_frames_processed:
                 stagnation_count += 1
                 if stagnation_count >= MAX_STAGNATION:
-                    raise RuntimeError(f"Stalled at frame {start_idx}")
+                    raise RuntimeError(
+                        f"Processing stalled at frame {start_idx}/{total_frames}.\n"
+                        f"Settings: batch={current_batch}, overlap={overlap_frames}, "
+                        f"tiling={enable_tiling}, tile={tile_size}"
+                    )
             else:
                 stagnation_count = 0
             last_frames_processed = frames_processed
@@ -1033,9 +637,18 @@ class UniversalSmartVAEVideoDecode:
             ctx_end = min(total_frames, end_idx + overlap_frames)
             
             if ctx_end <= ctx_start:
-                raise RuntimeError(f"Empty chunk")
+                raise RuntimeError(f"Empty chunk (ctx {ctx_start}→{ctx_end})")
             
             latent_chunk = latents[:, :, ctx_start:ctx_end, :, :]
+            
+            should_log = verbose and (chunk_count % log_every_n == 0 or end_idx == total_frames)
+            if should_log:
+                mem_gb = torch.cuda.memory_allocated() / (1024**3) if torch.cuda.is_available() else 0
+                logger.info(
+                    f"Chunk {chunk_count+1}/{est_total_chunks}: "
+                    f"latent {start_idx}→{end_idx} | ctx {ctx_start}→{ctx_end} | "
+                    f"VRAM: {mem_gb:.2f}GB"
+                )
             
             try:
                 with torch.no_grad():
@@ -1059,8 +672,9 @@ class UniversalSmartVAEVideoDecode:
             except RuntimeError as e:
                 if "out of memory" in str(e).lower():
                     oom_retry_count += 1
+                    
                     if verbose:
-                        logger.warning(f"OOM at {start_idx} (retry {oom_retry_count}/{self.MAX_OOM_RETRIES})")
+                        logger.warning(f"OOM at frame {start_idx} (retry {oom_retry_count}/{self.MAX_OOM_RETRIES})")
                     
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
@@ -1068,14 +682,24 @@ class UniversalSmartVAEVideoDecode:
                     gc.collect()
                     
                     if not enable_tiling:
+                        logger.info("→ Stage 1: Enabling tiling")
                         enable_tiling = True
+                        output_h, output_w = self.detect_output_size(
+                            vae, latents, h_latent, w_latent, tile_size, verbose=False
+                        )
                         continue
+                    
                     if current_batch > 1:
+                        old_batch = current_batch
                         current_batch = max(1, current_batch // 2)
                         overlap_frames = min(initial_overlap, current_batch - 1)
+                        logger.info(f"→ Stage 2: Batch {old_batch} → {current_batch}")
                         continue
+                    
                     if tile_size > 256:
+                        old_tile = tile_size
                         tile_size = max(256, tile_size - 128)
+                        logger.info(f"→ Stage 3: Tile {old_tile} → {tile_size}px")
                         continue
                     
                     continue
@@ -1092,64 +716,116 @@ class UniversalSmartVAEVideoDecode:
                 core_length = (end_idx - start_idx) * time_scale
                 valid_frames = decoded_chunk[front_trim:front_trim + core_length]
             
+            actual = valid_frames.shape[0]
+            if end_idx < total_frames:
+                expected = (end_idx - start_idx) * time_scale
+            else:
+                expected = expected_frames - cumulative_output_frames
+            
+            if should_log and abs(actual - expected) > 0:
+                logger.info(f"  Chunk frames: expected {expected}, got {actual}")
+            
             valid_frames = self._center_crop_to_reference(valid_frames, output_h, output_w)
             
-            for frame_idx in range(valid_frames.shape[0]):
-                frame = valid_frames[frame_idx]
-                
-                preview = writer.write_frame(frame)
-                
-                if preview is not None:
-                    preview_frames.append(torch.from_numpy(preview).float() / 255.0)
-                    if len(preview_frames) > 5:
-                        preview_frames.pop(0)
+            if verbose and chunk_count == 0:
+                logger.info(f"✓ First chunk: shape {valid_frames.shape}")
+                if (aspect_ratio > 1.0 and valid_frames.shape[2] > valid_frames.shape[1]) or \
+                   (aspect_ratio < 1.0 and valid_frames.shape[1] > valid_frames.shape[2]):
+                    warnings.warn("Orientation mismatch! Output may be rotated.")
+            
+            if use_disk_offload:
+                temp_path = os.path.join(self.temp_dir, f"chunk_{chunk_count:06d}.pt")
+                torch.save(valid_frames, temp_path)
+                temp_files.append(temp_path)
+            else:
+                final_output[current_write_idx:current_write_idx + actual] = valid_frames
+                current_write_idx += actual
             
             processed_this_chunk = end_idx - start_idx
             frames_processed += processed_this_chunk
+            cumulative_output_frames += actual
             pbar.update(processed_this_chunk)
-            
-            progress_pct = (writer.frames_written / expected_frames) * 100
-            if verbose:
-                logger.info(f"Progress: {writer.frames_written}/{expected_frames} ({progress_pct:.1f}%)")
-            
             start_idx = end_idx
+            chunk_count += 1
             
             del latent_chunk, decoded_chunk, valid_frames
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            
+            if chunk_count % 3 == 0 or current_batch <= 4:
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                    torch.cuda.empty_cache()
         
-        final_path = writer.finalize(audio_path if audio_path else None)
+        if use_disk_offload:
+            if verbose:
+                logger.info(f"🛡️  Assembling {len(temp_files)} chunks from disk...")
+            
+            chunks = []
+            for i, temp_path in enumerate(temp_files):
+                chunk = torch.load(temp_path, map_location='cpu')
+                chunks.append(chunk)
+                
+                try:
+                    os.remove(temp_path)
+                except Exception as e:
+                    logger.debug(f"Failed to remove temp file: {e}")
+                
+                if len(chunks) >= self.DISK_MERGE_CHUNK_SIZE or i == len(temp_files) - 1:
+                    merged = torch.cat(chunks, dim=0)
+                    chunks = [merged]
+                    gc.collect()
+            
+            final_output = chunks[0] if chunks else torch.empty((0, output_h, output_w, 3), dtype=torch.float32)
+            
+            self._cleanup_temp_dir()
+            self.temp_dir = None
         
+        if final_output.shape[0] > expected_frames:
+            final_output = final_output[:expected_frames]
+        
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+        
+        actual_frames = final_output.shape[0]
+        
+        # ============= FINAL WARNING =============
         if ignore_warnings != "none":
             logger.warning("=" * 70)
-            logger.warning("⚠️ VIDEO CREATED WITH WARNINGS IGNORED")
+            logger.warning("⚠️ VIDEO DECODED WITH WARNINGS IGNORED")
             logger.warning(f"   Mode: '{ignore_warnings}'")
             logger.warning(f"   Some frames MAY BE BLACK or corrupted")
             logger.warning("   Recommend: Check output before sharing")
             logger.warning("=" * 70)
+        # =========================================
         
         if verbose:
-            logger.info(f"✅ Streaming complete!")
-            logger.info(f"   File: {final_path}")
-            logger.info(f"   Frames: {writer.frames_written}")
-            file_size_mb = os.path.getsize(final_path) / (1024 * 1024)
-            logger.info(f"   Size: {file_size_mb:.2f} MB")
+            logger.info(f"✅ Decode complete!")
+            logger.info(f"   Output frames: {actual_frames}")
+            logger.info(f"   Final shape: {final_output.shape}")
         
-        if preview_frames:
-            preview_tensor = torch.stack(preview_frames, dim=0)
+        frame_diff = abs(actual_frames - expected_frames)
+        if frame_diff == 0:
+            if verbose:
+                logger.info(f"   🎵 Audio sync: PERFECT ✓")
+        elif frame_diff <= time_scale:
+            if verbose:
+                logger.info(f"   ⚠️  Minor diff: {frame_diff} (rounding, OK)")
         else:
-            preview_tensor = torch.empty(0, dtype=torch.float32)
+            if verbose:
+                logger.warning(f"Audio sync warning:")
+                logger.warning(f"   Expected: {expected_frames}, Got: {actual_frames}")
+                logger.warning(f"   Diff: {frame_diff} frames")
+                logger.warning(f"   Try: force_time_scale={time_scale-1} or {time_scale+1}")
         
-        logger.info("📸 NOTE: 'preview_thumbs' output is for live monitoring only (last 5 thumbnails). Full video is saved to disk.")
-        
-        return (preview_tensor, final_path)
+        return (final_output,)
 
 
 NODE_CLASS_MAPPINGS = {
-    "UniversalSmartVAEVideoDecode": UniversalSmartVAEVideoDecode,
+    "UniversalSmartVAEDecode": UniversalSmartVAEDecode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "UniversalSmartVAEVideoDecode": "🎬 Universal VAE Video Decode (Streaming)",
+    "UniversalSmartVAEDecode": "🎬 Universal VAE Decode (v11.3 + Ignore Warnings)",
 }
