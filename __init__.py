@@ -1,10 +1,19 @@
-# __init__.py
+"""
+ComfyUI-Grok-SmartVAE
+Production VAE decoders for long video sequences
+"""
 
-from .UniversalSmartVAEDecode import NODE_CLASS_MAPPINGS as N1, NODE_DISPLAY_NAME_MAPPINGS as D1
-from .universal_smart_vae_video_decode import NODE_CLASS_MAPPINGS as N2, NODE_DISPLAY_NAME_MAPPINGS as D2
+from .UniversalSmartVAEDecode import UniversalSmartVAEDecode
+from .universal_smart_vae_video_decode import UniversalSmartVAEVideoDecode
 
-# Łączymy mapowania – zakładając, że klucze się nie pokrywają
-NODE_CLASS_MAPPINGS = {**N1, **N2}
-NODE_DISPLAY_NAME_MAPPINGS = {**D1, **D2}
+NODE_CLASS_MAPPINGS = {
+    "UniversalSmartVAEDecode": UniversalSmartVAEDecode,
+    "UniversalSmartVAEVideoDecode": UniversalSmartVAEVideoDecode,
+}
+
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "UniversalSmartVAEDecode": "🎬 Universal VAE Decode (v11.3 + Ignore Warnings)",
+    "UniversalSmartVAEVideoDecode": "🎬 Universal VAE Video Decode (Streaming)",
+}
 
 __all__ = ['NODE_CLASS_MAPPINGS', 'NODE_DISPLAY_NAME_MAPPINGS']
