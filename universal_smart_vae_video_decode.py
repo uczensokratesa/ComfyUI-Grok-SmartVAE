@@ -126,11 +126,14 @@ class StreamingVideoWriter:
         self.resume = resume
         
         self.metadata_path = output_path + ".metadata.json"
-        self.temp_path = output_path + ".tmp"
+        base, ext = os.path.splitext(output_path)
+        self.temp_path = f"{base}.tmp{ext}" if ext else output_path + ".tmp"
         
         self.writer = None
         self.frames_written = 0
+        self.session_frames_written = 0
         self.last_preview = None
+        self.resume_prefix_path = None
         
         if resume and os.path.exists(self.metadata_path):
             self._load_metadata()
@@ -150,7 +153,29 @@ class StreamingVideoWriter:
             StreamingVideoConfig.CODECS["h264"]
         )
         
-        write_path = self.temp_path if not self.resume else self.output_path
+        write_path = self.temp_path
+        
+        # Resume metadata tracks total decoded output frames, but encoded containers
+        # cannot be safely appended with imageio. Keep previous partial video as a
+        # prefix and encode only the continuation segment into `temp_path`.
+        if self.resume and self.frames_written > 0:
+            if os.path.exists(self.output_path):
+                self.resume_prefix_path = self.output_path
+            elif os.path.exists(self.temp_path):
+                temp_base, temp_ext = os.path.splitext(self.temp_path)
+                prefix_backup = f"{temp_base}.resume_prefix{temp_ext}" if temp_ext else self.temp_path + ".resume_prefix"
+                try:
+                    os.replace(self.temp_path, prefix_backup)
+                    self.resume_prefix_path = prefix_backup
+                except Exception as e:
+                    logger.warning(f"Failed to preserve temp resume prefix: {e}")
+                    self.frames_written = 0
+            else:
+                logger.warning(
+                    "Resume metadata found but no partial video file exists. "
+                    "Restarting decode from frame 0."
+                )
+                self.frames_written = 0
         
         try:
             self.writer = imageio.get_writer(
@@ -165,6 +190,8 @@ class StreamingVideoWriter:
             
             logger.info(f"Video writer initialized: {codec_config['description']}")
             logger.info(f"Output: {write_path} ({self.width}x{self.height} @ {self.fps}fps)")
+            if self.resume_prefix_path:
+                logger.info(f"Resume prefix: {self.resume_prefix_path}")
             
         except Exception as e:
             logger.error(f"Failed to initialize video writer: {e}")
@@ -178,6 +205,7 @@ class StreamingVideoWriter:
         
         self.writer.append_data(frame_np)
         self.frames_written += 1
+        self.session_frames_written += 1
         
         preview = None
         if self.frames_written % StreamingVideoConfig.PREVIEW_INTERVAL == 0:
@@ -227,6 +255,58 @@ class StreamingVideoWriter:
             logger.warning(f"Metadata load failed: {e}")
             self.frames_written = 0
     
+    @staticmethod
+    def _escape_concat_path(path: str) -> str:
+        return path.replace("'", "'\\''")
+    
+    def _concat_videos(self, first_video: str, second_video: str) -> Optional[str]:
+        if not (os.path.exists(first_video) and os.path.exists(second_video)):
+            return None
+        
+        try:
+            import imageio_ffmpeg
+            ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+        except ImportError:
+            ffmpeg_exe = "ffmpeg"
+        
+        base, ext = os.path.splitext(self.output_path)
+        concat_output = f"{base}.concat{ext}"
+        concat_list = f"{base}.concat.txt"
+        
+        try:
+            with open(concat_list, "w", encoding="utf-8") as f:
+                f.write(f"file '{self._escape_concat_path(first_video)}'\n")
+                f.write(f"file '{self._escape_concat_path(second_video)}'\n")
+            
+            cmd = [
+                ffmpeg_exe, "-y",
+                "-f", "concat",
+                "-safe", "0",
+                "-i", concat_list,
+                "-c", "copy",
+                concat_output,
+            ]
+            subprocess.run(cmd, check=True, capture_output=True, timeout=600, text=True)
+            
+            if not os.path.exists(concat_output):
+                logger.error("FFmpeg concat succeeded but output not created")
+                return None
+            
+            os.replace(concat_output, self.output_path)
+            return self.output_path
+        
+        except Exception as e:
+            logger.error(f"FFmpeg concat error: {e}")
+            return None
+        
+        finally:
+            for cleanup_path in (concat_output, concat_list):
+                if os.path.exists(cleanup_path):
+                    try:
+                        os.remove(cleanup_path)
+                    except Exception:
+                        pass
+    
     def finalize(self, audio_path: Optional[str] = None) -> str:
         if self.writer:
             self.writer.close()
@@ -239,29 +319,55 @@ class StreamingVideoWriter:
                 pass
         
         temp_exists = os.path.exists(self.temp_path)
+        base_video_path = None
         
-        if not temp_exists:
-            if audio_path and os.path.exists(audio_path):
-                final_path = self._mux_audio(self.output_path, audio_path)
-                return final_path
-            return self.output_path
+        if self.resume_prefix_path and os.path.exists(self.resume_prefix_path):
+            if self.session_frames_written > 0 and temp_exists:
+                merged = self._concat_videos(self.resume_prefix_path, self.temp_path)
+                if merged:
+                    base_video_path = merged
+                else:
+                    logger.warning("Resume merge failed. Keeping previous partial output.")
+                    base_video_path = self.resume_prefix_path
+                    try:
+                        os.remove(self.temp_path)
+                    except Exception:
+                        pass
+            else:
+                base_video_path = self.resume_prefix_path
+                if temp_exists:
+                    try:
+                        os.remove(self.temp_path)
+                    except Exception:
+                        pass
+        elif temp_exists:
+            try:
+                os.replace(self.temp_path, self.output_path)
+                base_video_path = self.output_path
+            except Exception as e:
+                logger.error(f"Failed to move temp file: {e}")
+                base_video_path = self.temp_path
+        else:
+            base_video_path = self.output_path
+        
+        if base_video_path != self.output_path and os.path.exists(base_video_path):
+            try:
+                os.replace(base_video_path, self.output_path)
+                base_video_path = self.output_path
+            except Exception as e:
+                logger.warning(f"Could not normalize output path: {e}")
         
         if audio_path and os.path.exists(audio_path):
-            final_path = self._mux_audio(self.temp_path, audio_path)
-            if final_path == self.temp_path:
+            final_path = self._mux_audio(base_video_path, audio_path)
+            if final_path == base_video_path and base_video_path == self.temp_path:
                 try:
                     os.replace(self.temp_path, self.output_path)
                 except:
                     pass
                 return self.output_path
             return final_path
-        else:
-            try:
-                os.replace(self.temp_path, self.output_path)
-            except Exception as e:
-                logger.error(f"Failed to move temp file: {e}")
-                return self.temp_path
-            return self.output_path
+        
+        return base_video_path
     
     def _mux_audio(self, video_path: str, audio_path: str) -> str:
         if not os.path.exists(video_path):
@@ -338,7 +444,7 @@ class StreamingVideoWriter:
                 pass
 
 
-class UniversalSmartVAEVideoDecode:
+class SmartVAE_StreamingDecoder:
     """
     Standalone streaming video decode node with warning ignore option.
     """
@@ -569,6 +675,26 @@ class UniversalSmartVAEVideoDecode:
                 logger.info(f"   Estimated output: {output_h}×{output_w}")
             
             return output_h, output_w
+    
+    def _extract_tensor_output(self, tensor):
+        if isinstance(tensor, (list, tuple)):
+            if not tensor:
+                raise ValueError("VAE returned empty output")
+            tensor = tensor[0]
+        if not isinstance(tensor, torch.Tensor):
+            raise TypeError(f"Expected Tensor, got {type(tensor)}")
+        return tensor
+    
+    def _output_frames_to_latent_index(self, output_frames: int, time_scale: int, total_frames: int) -> int:
+        """Convert decoded output frame count to latent frame index for resume."""
+        if output_frames <= 0:
+            return 0
+        
+        if time_scale <= 1:
+            return min(output_frames, total_frames)
+        
+        latent_index = 1 + max(0, output_frames - 1) // time_scale
+        return min(latent_index, total_frames)
 
     def _normalize_output(self, tensor, aspect_ratio: Optional[float] = None) -> torch.Tensor:
         if isinstance(tensor, (list, tuple)):
@@ -675,7 +801,7 @@ class UniversalSmartVAEVideoDecode:
                 "For images (4D), use standard VAE Decode node."
             )
         
-        batch, channels, total_frames, h_latent, w_latent = latents.shape
+        batch, latent_channels, total_frames, h_latent, w_latent = latents.shape
         
         if total_frames <= 0:
             raise ValueError("Latent has no frames")
@@ -735,13 +861,13 @@ class UniversalSmartVAEVideoDecode:
                             ffmpeg_exe = "ffmpeg"
                         
                         waveform_np = (waveform.numpy() * 32767).astype('int16')
-                        channels = waveform_np.shape[0]
+                        audio_channels = waveform_np.shape[0]
                         
                         cmd = [
                             ffmpeg_exe, "-y",
                             "-f", "s16le",
                             "-ar", str(sample_rate),
-                            "-ac", str(channels),
+                            "-ac", str(audio_channels),
                             "-i", "pipe:0",
                             "-c:a", "pcm_s16le",
                             temp_audio_path
@@ -789,7 +915,7 @@ class UniversalSmartVAEVideoDecode:
                 resume_on_crash, frames_per_batch, overlap_frames,
                 force_time_scale, enable_tiling, tile_size, verbose,
                 time_scale, expected_frames, aspect_ratio, output_h, output_w,
-                h_latent, w_latent, channels, ignore_warnings
+                h_latent, w_latent, latent_channels, ignore_warnings
             )
         finally:
             if temp_audio_path and os.path.exists(temp_audio_path):
@@ -809,7 +935,7 @@ class UniversalSmartVAEVideoDecode:
                           resume_on_crash, frames_per_batch, overlap_frames,
                           force_time_scale, enable_tiling, tile_size, verbose,
                           time_scale, expected_frames, aspect_ratio, output_h, output_w,
-                          h_latent, w_latent, channels, ignore_warnings="none"):
+                          h_latent, w_latent, latent_channels, ignore_warnings="none"):
         """Streaming decode implementation with warning ignore."""
         
         batch, _, total_frames, _, _ = latents.shape
@@ -936,15 +1062,6 @@ class UniversalSmartVAEVideoDecode:
             else:
                 raise
         
-        # 2. Sprawdź czy total_frames zgadza się z expected_frames
-        if expected_frames is not None and total_frames != expected_frames:
-            logger.warning("=" * 70)
-            logger.warning(f"⚠️ FRAME COUNT MISMATCH!")
-            logger.warning(f"   Expected: {expected_frames} frames")
-            logger.warning(f"   Got:      {total_frames} frames")
-        # ...
-            logger.warning("=" * 70)
-        
         if total_frames > 1000:
             original_batch = frames_per_batch
             
@@ -991,7 +1108,7 @@ class UniversalSmartVAEVideoDecode:
         available_vram = self._get_available_vram()
         if available_vram is not None:
             chunk_frames = frames_per_batch + 2 * overlap_frames
-            est_vram = self._estimate_chunk_vram(chunk_frames, channels, h_latent, w_latent, time_scale)
+            est_vram = self._estimate_chunk_vram(chunk_frames, latent_channels, h_latent, w_latent, time_scale)
             
             if est_vram > available_vram * 0.55:
                 reduction = (available_vram * 0.45) / est_vram
@@ -1006,7 +1123,16 @@ class UniversalSmartVAEVideoDecode:
             logger.info(f"   Batch: {frames_per_batch}, Overlap: {overlap_frames}")
         
         current_batch = frames_per_batch
-        start_idx = writer.frames_written if resume_on_crash else 0
+        resume_output_frames = writer.frames_written if resume_on_crash else 0
+        start_idx = (
+            self._output_frames_to_latent_index(resume_output_frames, time_scale, total_frames)
+            if resume_on_crash else 0
+        )
+        if verbose and resume_output_frames > 0:
+            logger.info(
+                f"Resuming at latent frame {start_idx}/{total_frames} "
+                f"(decoded frames already written: {resume_output_frames})"
+            )
         frames_processed = 0
         last_frames_processed = -1
         stagnation_count = 0
@@ -1042,19 +1168,10 @@ class UniversalSmartVAEVideoDecode:
             try:
                 with torch.no_grad():
                     if enable_tiling and hasattr(vae, 'decode_tiled'):
-                        decoded_chunk = vae.decode_tiled(latent_chunk, tile_x=tile_size, tile_y=tile_size)
+                        decoded_raw = vae.decode_tiled(latent_chunk, tile_x=tile_size, tile_y=tile_size)
                     else:
-                        decoded_chunk = vae.decode(latent_chunk)
-                    decoded_chunk = decoded_chunk.cpu()
-                
-                decoded_chunk = torch.nan_to_num(decoded_chunk, nan=0.0, posinf=1.0, neginf=0.0)
-                decoded_chunk = torch.clamp(decoded_chunk, min=0.0, max=1.0)
-                
-                if verbose:
-                    min_val = decoded_chunk.min().item()
-                    max_val = decoded_chunk.max().item()
-                    if min_val < 0.0 or max_val > 1.0:
-                        logger.warning(f"   Chunk clamped: [{min_val:.4f}, {max_val:.4f}] → [0,1]")
+                        decoded_raw = vae.decode(latent_chunk)
+                    decoded_chunk = self._extract_tensor_output(decoded_raw).cpu()
                 
                 oom_retry_count = 0
             
@@ -1149,9 +1266,9 @@ class UniversalSmartVAEVideoDecode:
 
 
 NODE_CLASS_MAPPINGS = {
-    "UniversalSmartVAEVideoDecode": UniversalSmartVAEVideoDecode,
+    "SmartVAE_StreamingDecoder":SmartVAE_StreamingDecoder,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "UniversalSmartVAEVideoDecode": "🎬 Universal VAE Video Decode (Streaming)",
+    "SmartVAE_StreamingDecoder": "🎬 SmartVAE_StreamingDecoder (Streaming)",
 }
