@@ -159,4 +159,22 @@ User clicks dropdown, selects `minor`, re-runs → frames 856-1200 are black, re
 - **Psychology**: Prevents "this node is broken" frustration (user took calculated risk)
 
 **Credits**: Idea by Grok, implementation by Claude, inspired by user feedback requesting "decode anyway" option.
+**4. Release v11.5:**
+```
+feat: Rename streaming node + critical bug fixes (Codex)
+
+BREAKING CHANGE: UniversalSmartVAEVideoDecode → SmartVAE_StreamingDecoder
+
+Critical Fixes (OpenAI Codex):
+- Fixed resume latent index calculation (broken for time_scale>1)
+- Added video concatenation on resume (preserves previous work)
+- Fixed tuple handling from VAE output (crash prevention)
+- Added _extract_tensor_output helper (both nodes)
+- Improved resume logging and parameter naming
+
+Node Rename (ComfyUI Manager compatibility):
+- Streaming node: SmartVAEStreamingDecoder
+- Reason: Manager was deduplicating similar names
+
+Credits: OpenAI Codex (bug detection + fixes)
 
