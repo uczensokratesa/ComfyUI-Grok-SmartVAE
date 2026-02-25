@@ -1,4 +1,25 @@
 # ComfyUI-Grok-SmartVAE
+# 🎞️ SmartVAE Streaming Decoder (Advanced / Experimental Branch)
+
+**Branch: SmartVAE_AdvancedDecoder**  
+**Wersja: 2.0.0-experimental**  
+**Purpose of the branch:** Added the option of 'color bleed' correction (color skips at the contacts of the chunks) without spoiling the stable main version.
+
+### What's new in this branch
+
+- New node: **'SmartVAE_StreamingDecoder_Advanced'** (inherits from the original 'SmartVAE_StreamingDecoder')
+- New parameter: **'anti_color_bleed'** (BOOLEAN, default 'False')
+- When enabled: adjusts the mean and standard deviation of colors in the overlap zone between chunks
+- Reduces visible color skips in long chunk-generated videos
+- Very computationally light - cost
+1-2% decoding time
+- 100% backward compatibility maintained - old node works exactly the same
+
+### How to use the new version
+
+1. Switch to branch:
+'''bash
+git checkout SmartVAE_AdvancedDecoder...
 
 **The most crash-resistant and flexible VAE decoder for ComfyUI**  
 (designed for long video sequences: LTX-Video, Stable Video Diffusion, CogVideoX, AnimateDiff, HunyuanVideo, Open-Sora-Plan, etc.)
