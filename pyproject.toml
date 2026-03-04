@@ -1,13 +1,12 @@
 [project]
-name = "comfyui-grok-smartvae"
-version = "12.0.1"
+# Użyj starej nazwy, jeśli pod taką paczka jest już w Comfy Registry
+name = "grok-smartvae" 
+version = "12.0.2"
 description = "Robust VAE decoder suite with streaming output, temporal color correction, and advanced latent management for ComfyUI video workflows"
 readme = "README.md"
-license = {file = "LICENSE"}
 requires-python = ">=3.10"
-PublisherId = "uczensokratesa"
 authors = [
-    {name = "uczensokratesa", email = "your-email@example.com"}
+    {name = "uczensokratesa", email = "twój-email@example.com"} # Możesz podać fałszywy, byle format był poprawny
 ]
 keywords = ["comfyui", "vae", "video", "decoder", "streaming", "color-correction"]
 classifiers = [
@@ -16,8 +15,6 @@ classifiers = [
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
     "Topic :: Multimedia :: Video",
     "Topic :: Scientific/Engineering :: Artificial Intelligence"
 ]
@@ -30,34 +27,14 @@ dependencies = [
     "safetensors>=0.4.0",
 ]
 
-[project.optional-dependencies]
-dev = [
-    "pytest>=7.0.0",
-    "black>=23.0.0",
-    "ruff>=0.1.0"
-]
-full = [
-    "opencv-python>=4.8.0",
-    "psutil>=5.9.0",
-]
-
 [project.urls]
 Homepage = "https://github.com/uczensokratesa/ComfyUI-Grok-SmartVAE"
 Repository = "https://github.com/uczensokratesa/ComfyUI-Grok-SmartVAE"
 Issues = "https://github.com/uczensokratesa/ComfyUI-Grok-SmartVAE/issues"
 Changelog = "https://github.com/uczensokratesa/ComfyUI-Grok-SmartVAE/blob/main/CHANGELOG.md"
 
-[build-system]
-requires = ["setuptools>=61.0", "wheel"]
-build-backend = "setuptools.build_meta"
-
-[tool.setuptools]
-packages = ["comfyui_grok_smartvae"]
-
-[tool.black]
-line-length = 100
-target-version = ['py310']
-
-[tool.ruff]
-line-length = 100
-target-version = "py310"
+# === TUTAJ ZACZYNA SIĘ SEKCJA DLA COMFYUI REGISTRY ===
+[tool.comfy]
+PublisherId = "uczensokratesa"
+DisplayName = "ComfyUI-Grok-SmartVAE"
+Icon = "https://raw.githubusercontent.com/uczensokratesa/ComfyUI-Grok-SmartVAE/main/web/icon.png?raw=true"
