@@ -10,16 +10,15 @@
 
 ## 🎯 What's Included
 
-This package provides **4 production-ready nodes** for video generation workflows:
+This package provides **5 production-ready nodes**
 
 | Node | Purpose | Best For |
 |------|---------|----------|
-| **🎬 SmartVAE Streaming Decoder** | Frame-by-frame video encoding to disk | Long videos (500+ frames), limited RAM |
-| **🎞️ SmartVAE Advanced Decoder** | Streaming + temporal color correction | Professional color grading, zero flicker |
+| **🎬 Universal Smart VAE Decode** | In-memory full-tensor decode | Short videos (<500 frames), high VRAM |
+| **🎬 SmartVAE Streaming Decoder** | Frame-by-frame encoding to disk | Long videos (500+ frames), limited RAM |
+| **🎞️ SmartVAE Advanced Decoder** | Streaming + temporal color correction | Professional quality, zero flicker |
 | **📂 Advanced Load Latent** | Load saved latents with metadata | Iterative refinement workflows |
-| **🔍 Latent Metadata Viewer** | Inspect latent files without loading | Quick latent library browsing |
-
----
+| **🔍 Latent Metadata Viewer** | Inspect latent files without loading | Quick library browsing |
 
 ## ✨ Key Features
 
