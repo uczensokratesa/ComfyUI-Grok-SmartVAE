@@ -1,10 +1,11 @@
 [project]
 name = "comfyui-grok-smartvae"
-version = "12.0.0"
+version = "12.0.1"
 description = "Robust VAE decoder suite with streaming output, temporal color correction, and advanced latent management for ComfyUI video workflows"
 readme = "README.md"
 license = {file = "LICENSE"}
 requires-python = ">=3.10"
+PublisherId = "uczensokratesa"
 authors = [
     {name = "uczensokratesa", email = "your-email@example.com"}
 ]
