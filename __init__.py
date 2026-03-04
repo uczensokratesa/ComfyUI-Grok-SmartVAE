@@ -12,7 +12,7 @@ from .universal_smart_vae_video_decode import NODE_CLASS_MAPPINGS as StreamingDe
 from .smartvae_advanced_decoder import NODE_CLASS_MAPPINGS as AdvancedDecoder_mappings, \
                                        NODE_DISPLAY_NAME_MAPPINGS as AdvancedDecoder_display
 
-from .load_latent_node import NODE_CLASS_MAPPINGS as LoadLatent_mappings, \
+from .advanced_load_latent import NODE_CLASS_MAPPINGS as LoadLatent_mappings, \
                               NODE_DISPLAY_NAME_MAPPINGS as LoadLatent_display
 
 
