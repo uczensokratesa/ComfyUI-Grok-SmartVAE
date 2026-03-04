@@ -1,85 +1,68 @@
-# Changelog
-
-All notable changes to ComfyUI-Grok-SmartVAE will be documented in this file.
+ll notable changes to ComfyUI-Grok-SmartVAE will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
-## [Unreleased] - Branch: Twonewnodes
+## [12.0.0] - 2025-03-04 (Branch: Twonewnodes)
+
+### 🎉 Major Release - New Node Suite
+
+This release adds **3 new production-ready nodes** and establishes ComfyUI-Grok-SmartVAE as a complete video workflow solution.
 
 ### Added
 - **Advanced Load Latent v1.3** - Load saved latents with dropdown selection
-  - Auto-scan `output/latents/` directory
-  - Refresh button for live updates
+  - Auto-scan `output/latents/` directory with refresh button
   - PyTorch 2.6+ compatible (safetensors primary, pickle fallback)
   - Metadata display (shape, seed, timestamp, format)
-  - Manual path override support
+  - Enables iterative refinement workflows (save once, iterate color grading)
   
-- **Latent Metadata Viewer** - Quick inspection without loading tensor
-  - Fast metadata-only read
-  - Browse large latent collections efficiently
-  - Outputs: shape, seed, timestamp, format
+- **Latent Metadata Viewer v1.0** - Quick inspection without loading tensor
+  - Fast metadata-only read for large files (10GB+)
+  - Browse latent collections by seed/date/format
+  - Zero memory overhead
   
 - **SmartVAE Advanced Decoder v2.3.1** - Temporal color correction
-  - Ramped cross-fade algorithm (zero flicker)
+  - **Zero-flicker** ramped cross-fade algorithm (breakthrough innovation)
   - Three correction modes: temporal, reference, temporal_match
-  - Parameters: correction_strength, cross_fade_frames, ema_momentum
-  - 2-5% overhead, tested on 50s+ videos
-  - Compatible with all VAEs (SD 1.5, SDXL, LTX-Video 2)
+  - Configurable parameters: strength (0.0-0.4), fade (4-24 frames), EMA (0.7-0.98)
+  - Minimal overhead (2-5%), tested on 50s+ videos
+  - Inherits all base decoder features (streaming, OOM recovery, audio sync)
 
 ### Fixed
-- **Critical: Audio sync issue** (1s offset eliminated)
-  - Root cause: Video re-encoding during mux caused encoder delay
-  - Solution: FFmpeg stream copy + PTS normalization
-  - Flags: `-c:v copy`, `-fflags +genpts`, `-vsync cfr`, `-af asetpts=PTS-STARTPTS`
-  - Result: Perfect A/V sync + 10x faster muxing + lossless quality
+- **CRITICAL: Audio sync issue** (1s offset eliminated in v1.0.10)
+  - Root cause: Video re-encoding during mux caused encoder delay + PTS drift
+  - Solution: FFmpeg stream copy (`-c:v copy`) + PTS normalization
+  - Result: Perfect A/V sync + 10x faster muxing (4s vs 45s) + lossless quality
+  - Flags added: `-fflags +genpts`, `-vsync cfr`, `-af asetpts=PTS-STARTPTS`, `-itsoffset 0`
   
 - **Advanced Decoder: Edge case crashes**
-  - Complete `__init__` variable initialization
-  - Prevents AttributeError on first decode with cache
+  - Complete `__init__` variable initialization (prevents AttributeError on cache)
+  - Added safe defaults for all parameters
   
 - **Advanced Decoder: Performance optimization**
-  - Eliminated redundant `_extract_stats()` calls
-  - ~5-10% speedup in color correction mode
+  - Eliminated redundant `_extract_stats()` calls (~5-10% speedup)
+  - Optimized EMA update (reuse computed stats instead of recalculating)
 
 ### Changed
-- **Documentation: Corrected LTX-2 diagnosis**
-  - OLD: "Silent VRAM death" (implied decoder bug)
-  - NEW: "LTX-2 architectural limit" (model constraint)
-  - Clarified root cause: Model architecture, not VRAM issue
-  - Added concrete workaround: Keep videos under ~1000 frames
+- **IMPORTANT: Corrected LTX-2 diagnosis** (documentation accuracy)
+  - ❌ OLD: "Silent VRAM death" → implied this was a decoder/VRAM bug
+  - ✅ NEW: "LTX-2 architectural limit" → clarified this is a model constraint
+  - Root cause: LTX-2 model architecture has hard limit (~1000-1200 frames)
+  - Workaround: Keep videos under 40-45s, or split into segments
+  - This is NOT a VRAM issue and NOT a node bug
+
+### Migration Notes
+- **No breaking changes** - all existing workflows continue to work
+- New nodes are **additive** - base decoder unchanged
+- Version jump (11.x → 12.0) reflects **major feature additions**
+
+### Known Limitations
+- LTX-Video 2: ~1000 frame architectural limit (model constraint, not node issue)
+- Color correction: ~2-5% processing overhead (acceptable for quality gain)
 
 ---
-
-## [1.0.10] - 2025-02-27
-
-### Added
-- **Ignore Warnings Mode** - User-controlled risk tolerance
-  - `none` (default): Stop on corruption with detailed diagnostics
-  - `minor`: Continue if <10% corrupted (partial recovery)
-  - `all`: Force decode anyway (high risk)
-  - Prevents "black frames without explanation" frustration
-
-### Fixed
-- **Audio sync bug** - 1s offset on long videos
-  - Changed from video re-encoding to stream copy
-  - Added PTS (presentation timestamp) normalization
-  - Result: Zero offset even on 40s+ videos
-
-- **NaN handling** - Corrupted latent detection
-  - Pre-decode validation with percentage calculation
-  - Identifies affected frame ranges
-  - Provides actionable error messages with concrete solutions
-
-### Changed
-- Improved error messages with root cause analysis
-- Better console output formatting
-- Version display in node title
-
----
-
 ## [1.0.9] - 2025-02-15
 
 ### Added

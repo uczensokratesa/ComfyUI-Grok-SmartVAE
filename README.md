@@ -1,8 +1,8 @@
 # ComfyUI-Grok-SmartVAE
 
-**The most robust and memory-efficient VAE decoder suite for ComfyUI video workflows**
+**Version 12.0.0** - Production-Ready Video Workflow Suite
 
-Designed for long video sequences from LTX-Video, CogVideoX, AnimateDiff, HunyuanVideo, Mochi, and more.
+**The most robust and memory-efficient VAE decoder suite for ComfyUI video workflows**
 
 ![SmartVAE Nodes](SmartVAE_StreamingDecoder.jpeg)
 
