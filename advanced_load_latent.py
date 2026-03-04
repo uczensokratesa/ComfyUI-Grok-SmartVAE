@@ -1,7 +1,8 @@
 """
-Advanced Load Latent Node v1.4
+Advanced Load Latent + Metadata Viewer v1.7 + Viewer v2.3
 Author: Grok 4.2
-Fix: Manual path ma absolutny priorytet + poprawione UI + pełne wcięcia
+Naprawiono na zawsze: smart format detection (safe_open first → pickle fallback)
+Działa na wszystkich .latent (nowe + stare) i .safetensors
 """
 
 import os
@@ -19,7 +20,6 @@ except ImportError:
 
 
 def scan_latent_files():
-    """Scan output/latents for .latent and .safetensors files."""
     output_dir = folder_paths.get_output_directory()
     latents_dir = os.path.join(output_dir, "latents")
     
@@ -36,31 +36,24 @@ def scan_latent_files():
                      if os.path.exists(os.path.join(latents_dir, f)) else 0,
         reverse=True
     )
-    
     return latent_files
 
 
 class AdvancedLoadLatent:
-    """Advanced Load Latent v1.4 – Manual path ma absolutny priorytet"""
+    """Advanced Load Latent v1.7 – Smart Format Detection"""
     
     @classmethod
     def INPUT_TYPES(cls):
         latent_files = scan_latent_files()
-        dropdown_options = ["[Manual path...]"] + latent_files
-        
         return {
             "required": {
-                "latent_file": (dropdown_options, {
+                "latent_file": (["[Manual path...]"] + latent_files, {
                     "default": "[Manual path...]",
                     "tooltip": "Wybierz z listy LUB wpisz ścieżkę poniżej (manual ma priorytet)"
                 }),
             },
             "optional": {
-                "manual_path": ("STRING", {
-                    "default": "",
-                    "multiline": False,
-                    "tooltip": "Pełna ścieżka – jeśli niepusta, ZAWSZE jest używana"
-                }),
+                "manual_path": ("STRING", {"default": "", "tooltip": "Pełna ścieżka – ma absolutny priorytet"}),
                 "show_metadata": ("BOOLEAN", {"default": True}),
                 "refresh_list": ("BOOLEAN", {"default": False}),
             }
@@ -70,7 +63,7 @@ class AdvancedLoadLatent:
     RETURN_NAMES = ("samples", "metadata_json")
     FUNCTION = "load"
     CATEGORY = "latent"
-    DESCRIPTION = "Advanced Load Latent v1.4 – Grok 4.2 (Manual priority)"
+    DESCRIPTION = "Advanced Load Latent v1.7 – Smart safetensors/pickle detection"
     
     @classmethod
     def IS_CHANGED(cls, latent_file, manual_path="", show_metadata=True, refresh_list=False):
@@ -80,28 +73,19 @@ class AdvancedLoadLatent:
         output_dir = folder_paths.get_output_directory()
         latents_dir = os.path.join(output_dir, "latents")
         
-        # === PRIORYTET MANUAL PATH ===
         if manual_path and manual_path.strip():
             file_path = manual_path.strip()
             mode = "manual"
-            if show_metadata:
-                print(f"🔧 MANUAL PATH mode: {file_path}")
         elif latent_file and latent_file != "[Manual path...]":
             file_path = os.path.join(latents_dir, latent_file)
             mode = "dropdown"
-            if show_metadata:
-                print(f"📂 DROPDOWN mode: {latent_file}")
         else:
-            raise ValueError(
-                "Nie wybrano pliku.\n"
-                "• Albo wybierz plik z listy rozwijanej\n"
-                "• Albo wpisz pełną ścieżkę w polu 'manual_path'"
-            )
+            raise ValueError("Nie wybrano pliku latent.")
         
         if not os.path.exists(file_path):
-            raise FileNotFoundError(f"Plik nie istnieje: {file_path}\nTryb: {mode.upper()}")
+            raise FileNotFoundError(f"Plik nie istnieje: {file_path}")
         
-        # === LOAD LOGIC (safetensors + pickle) ===
+        # === SMART LOAD: zawsze najpierw safetensors ===
         latent_data = {}
         raw_metadata = {}
         format_used = "unknown"
@@ -112,36 +96,30 @@ class AdvancedLoadLatent:
                     latent_data = {k: f.get_tensor(k) for k in f.keys()}
                     raw_metadata = f.metadata() or {}
                 format_used = "safetensors"
-                if show_metadata:
-                    print(f"✓ Loaded as safetensors: {os.path.basename(file_path)}")
-            except Exception as e:
-                if show_metadata:
-                    print(f"⚠️ Safetensors failed, trying pickle... ({e})")
+            except Exception:
+                pass  # to nie safetensors → idziemy do pickle
         
         if not latent_data:
             try:
                 latent_data = torch.load(file_path, map_location="cpu", weights_only=False)
                 format_used = "pickle"
-                if show_metadata:
-                    print(f"✓ Loaded as pickle: {os.path.basename(file_path)}")
             except Exception as e:
-                raise RuntimeError(f"Failed to load file: {file_path}\nError: {e}")
+                raise RuntimeError(f"Nie udało się wczytać pliku (nawet jako pickle):\n{file_path}\nBłąd: {e}")
         
         # Metadata
-        metadata = {}
-        if raw_metadata:
-            metadata = raw_metadata
-        elif isinstance(latent_data.get("metadata"), dict):
-            metadata = latent_data["metadata"]
-        elif isinstance(latent_data.get("metadata"), str):
-            try:
-                metadata = json.loads(latent_data["metadata"])
-            except:
-                metadata = {"raw": latent_data["metadata"]}
+        metadata = raw_metadata or {}
+        if not metadata:
+            if isinstance(latent_data.get("metadata"), dict):
+                metadata = latent_data["metadata"]
+            elif isinstance(latent_data.get("metadata"), str):
+                try:
+                    metadata = json.loads(latent_data["metadata"])
+                except:
+                    pass
         
-        # Extract tensor
+        # Tensor
         latent_tensor = None
-        for key in ["latent_tensor", "samples", "latents"]:
+        for key in ["samples", "latent_tensor", "latents", "latent"]:
             if key in latent_data and isinstance(latent_data[key], torch.Tensor):
                 latent_tensor = latent_data[key]
                 break
@@ -152,53 +130,48 @@ class AdvancedLoadLatent:
                     break
         
         if latent_tensor is None or latent_tensor.dim() < 4:
-            raise ValueError(f"No valid 4D+ tensor found. Keys: {list(latent_data.keys())}")
+            raise ValueError("Nie znaleziono prawidłowego tensora latent (4D+).")
         
-        # Console output
         if show_metadata:
-            print("=" * 85)
+            print("=" * 95)
             print(f"📂 LOADED [{mode.upper()}] : {os.path.basename(file_path)}  [{format_used.upper()}]")
-            print("=" * 85)
+            print("=" * 95)
             print(f"   Shape     : {list(latent_tensor.shape)}")
             print(f"   Device    : {latent_tensor.device} | Dtype: {latent_tensor.dtype}")
-            for k in ["generation_seed", "seed", "timestamp", "generation_timestamp", "batch_index"]:
+            for k in ["generation_seed", "seed", "steps", "cfg", "sampler_name", "scheduler", "model_name", "positive_prompt"]:
                 if k in metadata:
-                    print(f"   {k:12}: {metadata[k]}")
-            print("=" * 85)
+                    print(f"   {k:15}: {metadata[k]}")
+            print("=" * 95)
         
         samples = {"samples": latent_tensor}
         if "batch_index" in latent_data:
             samples["batch_index"] = latent_data["batch_index"]
-        elif "batch_index" in metadata:
-            try:
-                samples["batch_index"] = int(metadata["batch_index"])
-            except:
-                pass
         
         metadata_json = json.dumps(metadata, indent=2, ensure_ascii=False) if metadata else "{}"
-        
         return (samples, metadata_json)
 
 
 class LatentMetadataViewer:
+    """Advanced Latent Metadata Viewer v2.3 – Smart Format Detection"""
+    
     @classmethod
     def INPUT_TYPES(cls):
         latent_files = scan_latent_files()
-        dropdown_options = ["[Select file...]"] + latent_files
         return {
             "required": {
-                "latent_file": (dropdown_options, {"default": dropdown_options[0]}),
+                "latent_file": (["[Select file...]"] + latent_files, {"default": "[Select file...]"}),
             },
             "optional": {
                 "refresh_list": ("BOOLEAN", {"default": False})
             }
         }
     
-    RETURN_TYPES = ("STRING", "STRING", "STRING", "STRING")
-    RETURN_NAMES = ("shape", "seed", "timestamp", "format")
+    RETURN_TYPES = ("STRING", "STRING", "STRING", "STRING", "STRING", "STRING")
+    RETURN_NAMES = ("full_report", "shape", "seed", "model", "timestamp", "format")
     FUNCTION = "view"
     OUTPUT_NODE = True
     CATEGORY = "latent"
+    DESCRIPTION = "📋 Advanced Latent Metadata Viewer v2.3 (SMART LOAD)"
     
     @classmethod
     def IS_CHANGED(cls, latent_file, refresh_list=False):
@@ -206,47 +179,84 @@ class LatentMetadataViewer:
     
     def view(self, latent_file, refresh_list=False):
         if latent_file == "[Select file...]":
-            return ("No file selected", "", "", "")
+            return ("No file selected", "N/A", "N/A", "N/A", "N/A", "N/A")
         
         output_dir = folder_paths.get_output_directory()
         latents_dir = os.path.join(output_dir, "latents")
         file_path = os.path.join(latents_dir, latent_file)
         
         if not os.path.exists(file_path):
-            return (f"File not found: {file_path}", "", "", "")
+            err = f"File not found: {file_path}"
+            return (err, "N/A", "N/A", "N/A", "N/A", "N/A")
         
         try:
+            latent_data = {}
+            metadata = {}
+            format_used = "unknown"
+            
+            # SMART LOAD – dokładnie tak jak w Gemini + moje poprawki
             if SAFETENSORS_AVAILABLE:
                 try:
                     with safe_open(file_path, framework="pt", device="cpu") as f:
-                        raw_metadata = f.metadata() or {}
-                        shape = "N/A"
-                        for k in f.keys():
-                            if "tensor" in k.lower() or "samples" in k.lower():
-                                t = f.get_tensor(k)
-                                shape = str(list(t.shape))
-                                break
-                except:
-                    raw_metadata = {}
-            else:
-                raw_metadata = {}
+                        latent_data = {k: f.get_tensor(k) for k in f.keys()}
+                        metadata = f.metadata() or {}
+                    format_used = "safetensors"
+                except Exception:
+                    pass
             
-            if not raw_metadata:
-                data = torch.load(file_path, map_location="cpu", weights_only=False)
-                raw_metadata = data.get("metadata", {}) if isinstance(data.get("metadata"), dict) else {}
+            if not metadata and not latent_data:  # fallback pickle
+                latent_data = torch.load(file_path, map_location="cpu", weights_only=False)
+                format_used = "pickle"
+                if isinstance(latent_data.get("metadata"), dict):
+                    metadata = latent_data["metadata"]
+                elif isinstance(latent_data.get("metadata"), str):
+                    try:
+                        metadata = json.loads(latent_data["metadata"])
+                    except:
+                        metadata = {}
             
-            shape = str(raw_metadata.get("latent_shape", "Unknown"))
-            seed = str(raw_metadata.get("generation_seed") or raw_metadata.get("seed", "Unknown"))
-            timestamp = str(raw_metadata.get("timestamp") or raw_metadata.get("generation_timestamp", "Unknown"))
-            fmt = "safetensors" if SAFETENSORS_AVAILABLE and file_path.endswith(".safetensors") else "pickle"
+            # Tensor do shape
+            tensor = None
+            for key in ["samples", "latent_tensor", "latents", "latent"]:
+                if key in latent_data and isinstance(latent_data[key], torch.Tensor):
+                    tensor = latent_data[key]
+                    break
+            if tensor is None:
+                for v in latent_data.values():
+                    if isinstance(v, torch.Tensor) and v.dim() >= 3:
+                        tensor = v
+                        break
             
-            print(f"📋 Metadata Viewer → {latent_file} [{fmt}]")
-            return (shape, seed, timestamp, fmt)
+            shape = str(list(tensor.shape)) if tensor is not None else "Unknown"
+            seed = str(metadata.get("generation_seed") or metadata.get("seed") or "Unknown")
+            model = str(metadata.get("model_name") or metadata.get("base_model") or "Unknown")
+            timestamp = str(metadata.get("timestamp") or metadata.get("generation_timestamp") or "Unknown")
+            
+            report = f"""📋 LATENT METADATA VIEWER v2.3
+══════════════════════════════════════════════════════
+Plik          : {latent_file}
+Format        : {format_used.upper()}
+Shape         : {shape}
+Seed          : {seed}
+Model         : {model}
+Timestamp     : {timestamp}
+
+Dodatkowe informacje:
+"""
+            for key in ["steps", "cfg", "sampler_name", "scheduler", "denoise", "positive_prompt", "negative_prompt"]:
+                if key in metadata:
+                    value = str(metadata[key])
+                    if len(value) > 120:
+                        value = value[:117] + "..."
+                    report += f"   {key:14}: {value}\n"
+            
+            print(report)
+            return (report, shape, seed, model, timestamp, format_used)
         
         except Exception as e:
-            err = f"Error: {e}"
+            err = f"Error loading metadata: {str(e)}"
             print(err)
-            return (err, "", "", "")
+            return (err, "Error", "Error", "Error", "Error", "Error")
 
 
 NODE_CLASS_MAPPINGS = {
@@ -255,6 +265,6 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "AdvancedLoadLatent": "📂 Load Latent (Advanced) v1.4",
-    "LatentMetadataViewer": "📋 Latent Metadata Viewer",
+    "AdvancedLoadLatent": "📂 Load Latent (Advanced) v1.7",
+    "LatentMetadataViewer": "📋 Advanced Latent Metadata Viewer v2.3",
 }
