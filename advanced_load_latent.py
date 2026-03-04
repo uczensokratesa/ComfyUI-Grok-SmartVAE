@@ -1,8 +1,7 @@
 """
-Advanced Load Latent + Metadata Viewer v1.7 + Viewer v2.3
-Author: Grok 4.2
-Naprawiono na zawsze: smart format detection (safe_open first → pickle fallback)
-Działa na wszystkich .latent (nowe + stare) i .safetensors
+Advanced Load Latent + Metadata Viewer v1.8 + Viewer v2.4
+Author: Grok 4.2 (finalna wersja przed PR)
+Smart safetensors/pickle detection + pełne emoji + czysty fallback
 """
 
 import os
@@ -40,7 +39,7 @@ def scan_latent_files():
 
 
 class AdvancedLoadLatent:
-    """Advanced Load Latent v1.7 – Smart Format Detection"""
+    """Advanced Load Latent v1.8 – Smart Format Detection"""
     
     @classmethod
     def INPUT_TYPES(cls):
@@ -53,7 +52,10 @@ class AdvancedLoadLatent:
                 }),
             },
             "optional": {
-                "manual_path": ("STRING", {"default": "", "tooltip": "Pełna ścieżka – ma absolutny priorytet"}),
+                "manual_path": ("STRING", {
+                    "default": "",
+                    "tooltip": "Pełna ścieżka – ma absolutny priorytet"
+                }),
                 "show_metadata": ("BOOLEAN", {"default": True}),
                 "refresh_list": ("BOOLEAN", {"default": False}),
             }
@@ -63,7 +65,7 @@ class AdvancedLoadLatent:
     RETURN_NAMES = ("samples", "metadata_json")
     FUNCTION = "load"
     CATEGORY = "latent"
-    DESCRIPTION = "Advanced Load Latent v1.7 – Smart safetensors/pickle detection"
+    DESCRIPTION = "📂 Advanced Load Latent v1.8 – Smart safetensors/pickle detection"
     
     @classmethod
     def IS_CHANGED(cls, latent_file, manual_path="", show_metadata=True, refresh_list=False):
@@ -89,6 +91,7 @@ class AdvancedLoadLatent:
         latent_data = {}
         raw_metadata = {}
         format_used = "unknown"
+        loaded_as_safetensors = False
         
         if SAFETENSORS_AVAILABLE:
             try:
@@ -96,15 +99,16 @@ class AdvancedLoadLatent:
                     latent_data = {k: f.get_tensor(k) for k in f.keys()}
                     raw_metadata = f.metadata() or {}
                 format_used = "safetensors"
+                loaded_as_safetensors = True
             except Exception:
-                pass  # to nie safetensors → idziemy do pickle
+                pass
         
-        if not latent_data:
+        if not loaded_as_safetensors:
             try:
                 latent_data = torch.load(file_path, map_location="cpu", weights_only=False)
                 format_used = "pickle"
             except Exception as e:
-                raise RuntimeError(f"Nie udało się wczytać pliku (nawet jako pickle):\n{file_path}\nBłąd: {e}")
+                raise RuntimeError(f"Nie udało się wczytać pliku:\n{file_path}\nBłąd: {e}")
         
         # Metadata
         metadata = raw_metadata or {}
@@ -152,7 +156,7 @@ class AdvancedLoadLatent:
 
 
 class LatentMetadataViewer:
-    """Advanced Latent Metadata Viewer v2.3 – Smart Format Detection"""
+    """Advanced Latent Metadata Viewer v2.4 – Smart Format Detection"""
     
     @classmethod
     def INPUT_TYPES(cls):
@@ -171,7 +175,7 @@ class LatentMetadataViewer:
     FUNCTION = "view"
     OUTPUT_NODE = True
     CATEGORY = "latent"
-    DESCRIPTION = "📋 Advanced Latent Metadata Viewer v2.3 (SMART LOAD)"
+    DESCRIPTION = "📋 Advanced Latent Metadata Viewer v2.4 (SMART LOAD)"
     
     @classmethod
     def IS_CHANGED(cls, latent_file, refresh_list=False):
@@ -193,18 +197,19 @@ class LatentMetadataViewer:
             latent_data = {}
             metadata = {}
             format_used = "unknown"
+            loaded_as_safetensors = False
             
-            # SMART LOAD – dokładnie tak jak w Gemini + moje poprawki
             if SAFETENSORS_AVAILABLE:
                 try:
                     with safe_open(file_path, framework="pt", device="cpu") as f:
                         latent_data = {k: f.get_tensor(k) for k in f.keys()}
                         metadata = f.metadata() or {}
                     format_used = "safetensors"
+                    loaded_as_safetensors = True
                 except Exception:
                     pass
             
-            if not metadata and not latent_data:  # fallback pickle
+            if not loaded_as_safetensors:
                 latent_data = torch.load(file_path, map_location="cpu", weights_only=False)
                 format_used = "pickle"
                 if isinstance(latent_data.get("metadata"), dict):
@@ -215,7 +220,7 @@ class LatentMetadataViewer:
                     except:
                         metadata = {}
             
-            # Tensor do shape
+            # Tensor
             tensor = None
             for key in ["samples", "latent_tensor", "latents", "latent"]:
                 if key in latent_data and isinstance(latent_data[key], torch.Tensor):
@@ -232,7 +237,7 @@ class LatentMetadataViewer:
             model = str(metadata.get("model_name") or metadata.get("base_model") or "Unknown")
             timestamp = str(metadata.get("timestamp") or metadata.get("generation_timestamp") or "Unknown")
             
-            report = f"""📋 LATENT METADATA VIEWER v2.3
+            report = f"""📋 LATENT METADATA VIEWER v2.4
 ══════════════════════════════════════════════════════
 Plik          : {latent_file}
 Format        : {format_used.upper()}
@@ -265,6 +270,6 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "AdvancedLoadLatent": "📂 Load Latent (Advanced) v1.7",
-    "LatentMetadataViewer": "📋 Advanced Latent Metadata Viewer v2.3",
+    "AdvancedLoadLatent": "📂 Load Latent (Advanced) v1.8",
+    "LatentMetadataViewer": "📋 Advanced Latent Metadata Viewer v2.4",
 }
