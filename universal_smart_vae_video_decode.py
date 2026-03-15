@@ -15,7 +15,7 @@ Features:
 - Auto-detection of RAM/VRAM availability
 - NEW: Ignore warnings mode (risk of black frames)
 
-Version: 1.0.9 (Ignore Warnings + NaN handling from Claude)
+Version: 1.0.10 (VHS frame_rate compatibility - fps now FLOAT)
 License: MIT
 """
 
@@ -500,12 +500,12 @@ class SmartVAE_StreamingDecoder:
                     "multiline": False,
                     "tooltip": "Output path. Empty = auto-generated."
                 }),
-                "fps": ("INT", {
-                    "default": 24,
-                    "min": 1,
+                "fps": ("FLOAT", {
+                    "default": 24.0,
+                    "min": 1.0,
                     "max": 120,
                     "step": 1,
-                    "tooltip": "Frames per second"
+                    "tooltip": "Frame rate (fps). Supports fractional values (23.976, 29.97, etc.). Connect VHS 'get_fps' output here."
                 }),
                 "codec": (list(StreamingVideoConfig.CODECS.keys()), {
                     "default": "h264",
@@ -783,9 +783,32 @@ class SmartVAE_StreamingDecoder:
 
     def decode(self, vae, samples, frames_per_batch, overlap_frames=2, force_time_scale=0, 
                enable_tiling=False, tile_size=512, verbose=False,
-               video_output_path="", fps=24, codec="h264", audio_path="", audio=None, 
+               video_output_path="", fps=24.0, codec="h264", audio_path="", audio=None, 
                resume_on_crash=True, ignore_warnings="none"):
         self._verbose = verbose
+        
+        # ============= FRAME RATE HANDLING =============
+        # fps is now FLOAT (supports 23.976, 29.97, etc from VHS get_fps)
+        # Video encoders need INT fps, so round fractional values
+        
+        if not isinstance(fps, (int, float)):
+            raise TypeError(f"fps must be numeric, got {type(fps)}")
+        
+        final_fps = int(round(fps))
+        
+        # Log if rounding occurred (fractional fps like 23.976 → 24)
+        if verbose and abs(fps - final_fps) > 0.01:
+            logger.info(f"🎬 Frame rate: {fps:.3f} fps → rounded to {final_fps} for encoding")
+        elif verbose:
+            logger.info(f"🎬 Frame rate: {fps:.3f} fps")
+        
+        # Validation
+        if final_fps < 1 or final_fps > 240:
+            raise ValueError(f"Invalid frame rate: {final_fps} fps (must be 1-240)")
+        
+        # Use final_fps for video writer (rest of function expects INT)
+        fps = final_fps
+        # ===============================================
         
         if not IMAGEIO_AVAILABLE or not NUMPY_AVAILABLE:
             raise RuntimeError(
