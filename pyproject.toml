@@ -1,12 +1,12 @@
 [project]
-# Użyj starej nazwy, jeśli pod taką paczka jest już w Comfy Registry
+
 name = "grok-smartvae" 
 version = "12.1"
 description = "Robust VAE decoder suite with streaming output, temporal color correction, and advanced latent management for ComfyUI video workflows"
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [
-    {name = "uczensokratesa", email = "twój-email@example.com"} # Możesz podać fałszywy, byle format był poprawny
+    {name = "uczensokratesa", email = "twój-email@example.com"} 
 ]
 keywords = ["comfyui", "vae", "video", "decoder", "streaming", "color-correction"]
 classifiers = [
