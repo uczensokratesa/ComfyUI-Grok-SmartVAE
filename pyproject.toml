@@ -1,7 +1,7 @@
 [project]
 
 name = "grok-smartvae" 
-version = "12.1"
+version = "12.1.1"
 description = "Robust VAE decoder suite with streaming output, temporal color correction, and advanced latent management for ComfyUI video workflows"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -36,5 +36,5 @@ Changelog = "https://github.com/uczensokratesa/ComfyUI-Grok-SmartVAE/blob/main/C
 # === TUTAJ ZACZYNA SIĘ SEKCJA DLA COMFYUI REGISTRY ===
 [tool.comfy]
 PublisherId = "uczensokratesa"
-DisplayName = "ComfyUI-Grok-SmartVAE"
+DisplayName = "grok-smartvae"
 Icon = "https://raw.githubusercontent.com/uczensokratesa/ComfyUI-Grok-SmartVAE/main/web/icon.png?raw=true"
