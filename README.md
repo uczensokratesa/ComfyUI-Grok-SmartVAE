@@ -561,6 +561,10 @@ Attribution appreciated but not required.
 - ✨ First ComfyUI Registry release
 - ✨ Production-ready stability
 
+  ### v12.5
+- ✨ Rewrite code for Advanced Decoder by Claude AI.
+- ✨ Independent from Streaming Decoder to really have ability to color correction.
+
 ---
 
 **Happy generating! 🎬✨**
