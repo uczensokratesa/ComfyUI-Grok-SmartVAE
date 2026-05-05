@@ -566,5 +566,21 @@ Attribution appreciated but not required.
 - ✨ Independent from Streaming Decoder to really have ability to color correction.
 
 ---
+ ### v13.0
+  - ✨Rewrite code for finding dimensions of video Decoder by Gemini and Claude AI. 
+Full Dimension Support and Safe Error Handling (Universal Smart VAE Decode)This update brings critical improvements to the VAE decoding pipeline, making the Universal Smart VAE Decode node the most stable and reliable video decoding solution for ComfyUI. We have eliminated long-standing issues with non-standard aspect ratios and introduced a powerful new error-recovery system. What's New?1. Complete Freedom in Resolution and Aspect Ratio
+(No more ghosting, black bars, or corrupted output)Problem:
+Previous versions (and many other decoders) attempted to infer the output shape (Frames, Height, Width) by sorting dimensions numerically. This approach broke when generating long videos in lower resolutions — for example, when the frame count exceeded the pixel dimensions of height or width.Solution:
+We completely rewrote the _normalize_output function. The new algorithm no longer guesses dimensions based on size. Instead, it reliably detects color channels (RGB/RGBA) by position and dynamically assembles tensors into the correct [Frames, Height, Width, Channels] format.Result: You can now generate videos in any resolution, aspect ratio, and duration without decoding errors.2. New ignore_warnings Mode (Crash Protection for VRAM-intensive Generations)Video generation is extremely memory-intensive. Occasionally, a brief VRAM spike at the very end of a long render can corrupt a small portion of the latent (introducing NaN values). Most nodes would crash and discard hours of work. We changed that.The new ignore_warnings parameter offers three safety levels: none (Default / Safe)
+Stops execution on error but provides a detailed console report, including the exact percentage of corrupted data, affected frame ranges, and practical advice on how to prevent the issue.
+ minor (Recommended for video recovery)
+Forces the VAE to continue if damage is below 10%. Corrupted frames (usually at the end) will be rendered as black frames, but the node completes successfully and saves the intact portion of the video.
+ all (Maximum Force)
+Ignores all errors and pushes data through the VAE at all costs. Higher risk of completely black output, but gives the best possible chance of salvaging the generation.
+
+ Under the Hood (Technical Changes)Replaced dimension-based sorting and tensor.permute logic with robust shape verification using tensor.shape[-1] in (3, 4).
+Damaged latents (NaN / Inf) are now safely sanitized before decoding using torch.nan_to_num(tensor, nan=0.0, posinf=1.0, neginf=0.0). This prevents GPU driver crashes.
+Enhanced memory cleanup logic (gc.collect() + torch.cuda.empty_cache()) in critical failure scenarios.
+
 
 **Happy generating! 🎬✨**

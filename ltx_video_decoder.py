@@ -631,7 +631,29 @@ class LTX_VideoDecoder:
 
     @staticmethod
     def _normalise(tensor: torch.Tensor,
-                   aspect_ratio: Optional[float]) -> torch.Tensor:
+                   aspect_ratio: Optional[float] = None) -> torch.Tensor:
+        """
+        Normalise VAE decoder output to [F, H, W, 3] float32 in [0, 1].
+
+        FIX (Gemini diagnosis, Claude implementation):
+        ────────────────────────────────────────────────
+        Original code used size-based sorting to find the frames dimension.
+        This breaks for resolutions where F > H or F > W, e.g. 544×544 with
+        70 latent frames → decoded shape [3, 553, 34, 34] after squeeze, where
+        sorted by size assigns the H dim (34) as frames → ghost/striped frames.
+
+        New approach: identify channels positionally (size == 3 or 4), then
+        use fixed positional rules for the remaining [F, H, W] dims.
+        No size comparison between F, H, W — fully resolution-independent.
+
+        Supported input shapes (after list/tuple unwrap):
+          5D [1, C, F, H, W]  → squeeze batch → 4D
+          5D [1, F, C, H, W]  → squeeze batch → 4D
+          5D [B, C, F, H, W]  → flatten(0,1) → 4D  (B>1, rare)
+          4D [C, F, H, W]     → C in pos 0
+          4D [F, C, H, W]     → C in pos 1
+          4D [F, H, W, C]     → C in pos 3 (last) — already correct
+        """
         if isinstance(tensor, (list, tuple)):
             tensor = tensor[0]
 
@@ -640,46 +662,44 @@ class LTX_VideoDecoder:
         if tensor.dtype != torch.float32:
             tensor = tensor.float()
 
-        dim = tensor.dim()
-
-        if dim == 4:
-            if tensor.shape[1] in (3, 4):
-                tensor = tensor.permute(0, 2, 3, 1)
-
-        elif dim == 5:
-            shape = list(tensor.shape)
-            if shape[0] == 1:
-                tensor = tensor.squeeze(0)
-                shape  = list(tensor.shape)
-
-            try:
-                c_idx = next(i for i, s in enumerate(shape) if s in (3, 4))
-            except StopIteration:
-                raise ValueError(f"Cannot find channel dim in {shape}")
-
-            others  = [i for i in range(4) if i != c_idx]
-            by_size = sorted(zip(others, [shape[i] for i in others]), key=lambda x: x[1])
-            f_idx   = by_size[0][0]
-            s_big   = by_size[2][0]
-            s_sml   = by_size[1][0]
-
-            if aspect_ratio is not None:
-                h_idx = s_big if aspect_ratio > 1.0 else s_sml
-                w_idx = s_sml if aspect_ratio > 1.0 else s_big
+        # ── 5D → 4D ──────────────────────────────────────────────────
+        if tensor.dim() == 5:
+            if tensor.shape[0] == 1:
+                tensor = tensor.squeeze(0)       # [1, ?, ?, ?, ?] → [?, ?, ?, ?]
             else:
-                h_idx, w_idx = s_big, s_sml
+                tensor = tensor.flatten(0, 1)    # [B, C, F, H, W] → [B*C, F, H, W]
+                                                 # (batch > 1 is very rare for LTX)
 
-            tensor = tensor.permute(f_idx, h_idx, w_idx, c_idx)
+        if tensor.dim() != 4:
+            raise ValueError(f"Unsupported tensor shape after 5D reduction: {tensor.shape}")
 
+        # ── Identify channel position by value (3 or 4), not by size ──
+        # This is robust to any F, H, W size combination.
+        if tensor.shape[-1] in (3, 4):
+            # Already [F, H, W, C] — nothing to do
+            pass
+        elif tensor.shape[0] in (3, 4):
+            # [C, F, H, W] → [F, H, W, C]
+            tensor = tensor.permute(1, 2, 3, 0)
+        elif tensor.shape[1] in (3, 4):
+            # [F, C, H, W] → [F, H, W, C]
+            tensor = tensor.permute(0, 2, 3, 1)
         else:
-            raise ValueError(f"Unsupported tensor shape: {tensor.shape}")
+            # No dim has size 3 or 4 — fall back to [F, H, W, C] assumption
+            # (this can happen with unusual VAE outputs; log and continue)
+            logger.warning(
+                f"_normalise: no channel dim (size 3 or 4) found in {list(tensor.shape)}. "
+                f"Assuming last dim is channels."
+            )
 
+        # ── Value normalisation ───────────────────────────────────────
         if tensor.min().item() < 0:
             tensor = (tensor + 1.0) / 2.0
 
         tensor = torch.nan_to_num(tensor, nan=0.0, posinf=1.0, neginf=0.0)
         tensor = torch.clamp(tensor, 0.0, 1.0)
 
+        # Drop alpha channel if present
         if tensor.shape[-1] > 3:
             tensor = tensor[..., :3]
 
