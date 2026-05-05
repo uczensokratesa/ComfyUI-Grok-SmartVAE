@@ -566,5 +566,7 @@ Attribution appreciated but not required.
 - ✨ Independent from Streaming Decoder to really have ability to color correction.
 
 ---
-
+ ### v13.0
+  - ✨Rewrite code for finding dimensions of video Decoder by Gemini and Claude AI.
+  Now all sizes are ok.
 **Happy generating! 🎬✨**
