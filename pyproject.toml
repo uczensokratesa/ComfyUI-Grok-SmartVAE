@@ -1,7 +1,7 @@
 [project]
 
 name = "grok-smartvae" 
-version = "12.5.0"
+version = "13.0.0"
 description = "Robust VAE decoder suite with streaming output, temporal color correction, and advanced latent management for ComfyUI video workflows"
 readme = "README.md"
 requires-python = ">=3.10"
