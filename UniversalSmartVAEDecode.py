@@ -282,78 +282,70 @@ class UniversalSmartVAEDecode:
         return (expected_frames * bytes_per_frame) / (1024 ** 3)
 
     def _normalize_output(self, tensor, aspect_ratio: Optional[float] = None) -> torch.Tensor:
+        """
+        Normalise VAE output to [F, H, W, 3] float32 in [0, 1].
+
+        FIX: replaced size-based dimension sorting with positional channel
+        detection. Original code sorted [F, H, W] by numeric size to identify
+        the frames axis — breaks when F > H or F > W (e.g. 544×544 with 70+
+        latent frames decoded to 553 px frames), producing ghost/striped output.
+        New code identifies C by value (3 or 4), derives F/H/W positionally.
+        """
         if isinstance(tensor, (list, tuple)):
             if not tensor:
                 raise ValueError("VAE returned empty output")
             tensor = tensor[0]
-        
+
         if not isinstance(tensor, torch.Tensor):
             raise TypeError(f"Expected Tensor, got {type(tensor)}")
-        
+
         if tensor.dtype != torch.float32:
             tensor = tensor.float()
-        
-        dim = tensor.dim()
-        
-        if dim == 4:
-            if tensor.shape[1] in (3, 4):
-                tensor = tensor.permute(0, 2, 3, 1)
-        
-        elif dim == 5:
-            shape = list(tensor.shape)
-            
-            if shape[0] == 1:
+
+        # ── 5D → 4D ──────────────────────────────────────────────────
+        if tensor.dim() == 5:
+            if tensor.shape[0] == 1:
                 tensor = tensor.squeeze(0)
-                shape = list(tensor.shape)
-            
-            try:
-                c_idx = next(i for i, s in enumerate(shape) if s in (3, 4))
-            except StopIteration:
-                raise ValueError(f"Cannot find channel dim in {shape}")
-            
-            remaining_idxs = [i for i in range(4) if i != c_idx]
-            remaining_sizes = [shape[i] for i in remaining_idxs]
-            
-            sorted_remaining = sorted(zip(remaining_idxs, remaining_sizes), key=lambda x: x[1])
-            f_idx = sorted_remaining[0][0]
-            spatial_large_idx = sorted_remaining[2][0]
-            spatial_small_idx = sorted_remaining[1][0]
-            
-            if aspect_ratio is not None:
-                if aspect_ratio > 1.0:
-                    h_idx = spatial_large_idx
-                    w_idx = spatial_small_idx
-                else:
-                    w_idx = spatial_large_idx
-                    h_idx = spatial_small_idx
             else:
-                h_idx = spatial_large_idx
-                w_idx = spatial_small_idx
-            
-            perm = [f_idx, h_idx, w_idx, c_idx]
-            tensor = tensor.permute(*perm)
-        
+                tensor = tensor.flatten(0, 1)
+
+        if tensor.dim() != 4:
+            raise ValueError(f"Unsupported: {tensor.dim()}D, shape {tensor.shape}")
+
+        # ── Channel detection by value (3 or 4), not by size ─────────
+        if tensor.shape[-1] in (3, 4):
+            pass                                    # [F, H, W, C] — already correct
+        elif tensor.shape[0] in (3, 4):
+            tensor = tensor.permute(1, 2, 3, 0)    # [C, F, H, W] → [F, H, W, C]
+        elif tensor.shape[1] in (3, 4):
+            tensor = tensor.permute(0, 2, 3, 1)    # [F, C, H, W] → [F, H, W, C]
         else:
-            raise ValueError(f"Unsupported: {dim}D, shape {tensor.shape}")
-        
+            logger.warning(
+                f"_normalize_output: no channel dim (size 3 or 4) in {list(tensor.shape)}. "
+                f"Assuming last dim is channels."
+            )
+
+        # ── Value normalisation ───────────────────────────────────────
         min_val = tensor.min().item()
         max_val = tensor.max().item()
-        
+
         if min_val < 0.0:
             tensor = (tensor + 1.0) / 2.0
-        
+
         tensor = torch.nan_to_num(tensor, nan=0.0, posinf=1.0, neginf=0.0)
         tensor = torch.clamp(tensor, 0.0, 1.0)
-        
+
         if self._verbose:
             if min_val < 0.0 or max_val > 1.0:
-                logger.warning(f"Normalize: auto-scaled and clamped [{min_val:.4f}, {max_val:.4f}] → [0,1]")
+                logger.warning(
+                    f"Normalize: auto-scaled and clamped [{min_val:.4f}, {max_val:.4f}] → [0,1]"
+                )
             if torch.isnan(tensor).any() or torch.isinf(tensor).any():
                 logger.warning("NaN/Inf detected and cleaned in output!")
-        
+
         if tensor.shape[-1] > 3:
             tensor = tensor[..., :3]
-        
+
         return tensor.contiguous()
 
     def _center_crop_to_reference(self, tensor: torch.Tensor, h_ref: int, w_ref: int) -> torch.Tensor:
